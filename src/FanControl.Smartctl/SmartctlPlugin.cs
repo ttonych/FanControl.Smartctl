@@ -58,7 +58,12 @@ namespace FanControl.Smartctl
                 var cfg = Path.Combine(dllDir, "FanControl.Smartctl.json");
                 if (File.Exists(cfg))
                 {
-                    var json = JsonSerializer.Deserialize<PluginConfig>(File.ReadAllText(cfg));
+                    var jsonOptions = new JsonSerializerOptions
+                    {
+                        ReadCommentHandling = JsonCommentHandling.Skip,
+                        AllowTrailingCommas = true
+                    };
+                    var json = JsonSerializer.Deserialize<PluginConfig>(File.ReadAllText(cfg), jsonOptions);
                     if (json != null)
                     {
                         if (!string.IsNullOrWhiteSpace(json.SmartctlPath)) _smartctlPath = json.SmartctlPath!;
