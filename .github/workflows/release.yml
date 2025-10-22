@@ -37,8 +37,12 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist\Plugins | Out-Null
-          Copy-Item -Path src\FanControl.Smartctl\bin\Release\net8.0-windows\FanControl.Smartctl.dll -Destination dist\Plugins\
-          Copy-Item -Path src\FanControl.Smartctl\FanControl.Smartctl.sample.json -Destination dist\Plugins\FanControl.Smartctl.json -Force
+          Copy-Item -Path src\FanControl.Smartctl\bin\Release\net8.0-windows\FanControl.Smartctl.dll `
+                    -Destination dist\Plugins\ `
+                    -Force
+          Copy-Item -Path src\FanControl.Smartctl\FanControl.Smartctl.sample.json `
+                    -Destination dist\Plugins\FanControl.Smartctl.json `
+                    -Force
           Compress-Archive -Path dist\Plugins\* -DestinationPath dist\FanControl.Smartctl.zip -Force
 
       - name: Create GitHub Release and upload asset
