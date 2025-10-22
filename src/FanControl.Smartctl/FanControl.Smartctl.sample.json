@@ -50,6 +50,8 @@
 
   // Virtual cages let you group multiple disks together.
   // Each cage exposes Min, Max and Average temperature sensors that aggregate the disks it contains.
+  // Disk entries accept any token that matches a discovered sensor: device paths/tokens (e.g. "\\\\.\\PHYSICALDRIVE0"),
+  // serial numbers, model names, Windows friendly names, or even drive letters such as "C".
   "cages": [
     {
       "name": "Front Cage",
