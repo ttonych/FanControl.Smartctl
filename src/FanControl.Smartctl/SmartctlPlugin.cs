@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -60,11 +61,11 @@ namespace FanControl.Smartctl
             if (scan.ExitCode != 0)
             {
                 _log?.Log($"[Smartctl] smartctl scan failed: {scan.StdErr} {scan.StdOut}");
-                _dialog?.ShowMessageBox("Smartctl scan failed. See log.");
+                TryShowDialogMessage(_dialog, "Smartctl scan failed. See log.");
                 return;
             }
 
-            SmartctlScanOpenResult scanObj;
+            SmartctlScanOpenResult? scanObj;
             try
             {
                 scanObj = JsonSerializer.Deserialize<SmartctlScanOpenResult>(scan.StdOut);
@@ -75,13 +76,14 @@ namespace FanControl.Smartctl
                 return;
             }
 
-            if (scanObj?.Devices == null || scanObj.Devices.Count == 0)
+            var devices = scanObj?.Devices;
+            if (devices == null || devices.Count == 0)
             {
                 _log?.Log("[Smartctl] no devices found by smartctl --scan-open");
                 return;
             }
 
-            foreach (var dev in scanObj.Devices)
+            foreach (var dev in devices)
             {
                 if (dev.Type != null && dev.Type.Contains("nvme", StringComparison.OrdinalIgnoreCase))
                     continue;
@@ -103,7 +105,7 @@ namespace FanControl.Smartctl
                 );
 
                 _sensors.Add(sensor);
-                container.Temperatures.Add(sensor);
+                RegisterSensor(container, sensor);
             }
 
             _log?.Log($"[Smartctl] added sensors: {_sensors.Count}");
@@ -125,6 +127,93 @@ namespace FanControl.Smartctl
         }
 
         public void Close() { }
+
+        private void RegisterSensor(IPluginSensorsContainer container, IPluginSensor sensor)
+        {
+            try
+            {
+                var containerType = container.GetType();
+
+                var tempsProp = containerType.GetProperty("Temperatures");
+                if (tempsProp?.GetValue(container) is IList list)
+                {
+                    list.Add(sensor);
+                    return;
+                }
+
+                static bool TryInvoke(IPluginSensorsContainer target, string methodName, IPluginSensor sensor)
+                {
+                    var method = target.GetType().GetMethod(methodName, new[] { typeof(IPluginSensor) });
+                    if (method == null) return false;
+                    method.Invoke(target, new object?[] { sensor });
+                    return true;
+                }
+
+                if (TryInvoke(container, "AddTemperatureSensor", sensor)) return;
+                if (TryInvoke(container, "AddSensor", sensor)) return;
+                if (TryInvoke(container, "RegisterSensor", sensor)) return;
+
+                _log?.Log("[Smartctl] unable to register smartctl sensor: unsupported container API");
+            }
+            catch (Exception ex)
+            {
+                _log?.Log($"[Smartctl] failed to register smartctl sensor: {ex}");
+            }
+        }
+
+        private static void TryShowDialogMessage(IPluginDialog? dialog, string message)
+        {
+            if (dialog is null) return;
+
+            try
+            {
+                var type = dialog.GetType();
+
+                if (TryInvoke(type, dialog, "ShowMessageBox", new object?[] { message })) return;
+                if (TryInvoke(type, dialog, "ShowMessage", new object?[] { message })) return;
+                if (TryInvoke(type, dialog, "ShowErrorMessage", new object?[] { message })) return;
+                if (TryInvoke(type, dialog, "ShowError", new object?[] { message })) return;
+
+                if (TryInvoke(type, dialog, "ShowMessage", new object?[] { "Smartctl", message })) return;
+                if (TryInvoke(type, dialog, "ShowMessage", new object?[] { message, "Smartctl" })) return;
+                if (TryInvoke(type, dialog, "ShowMessageBox", new object?[] { "Smartctl", message })) return;
+                if (TryInvoke(type, dialog, "ShowMessageBox", new object?[] { message, "Smartctl" })) return;
+                if (TryInvoke(type, dialog, "ShowMessageDialog", new object?[] { "Smartctl", message })) return;
+                if (TryInvoke(type, dialog, "ShowMessageDialog", new object?[] { message, "Smartctl" })) return;
+            }
+            catch (Exception)
+            {
+                // fall back to silent failure; message already logged by caller
+            }
+
+            static bool TryInvoke(Type type, object target, string methodName, object?[] args)
+            {
+                try
+                {
+                    var argTypes = Array.ConvertAll(args, a => a?.GetType() ?? typeof(object));
+                    var method = type.GetMethod(methodName, argTypes);
+                    if (method == null)
+                    {
+                        foreach (var m in type.GetMethods())
+                        {
+                            if (!string.Equals(m.Name, methodName, StringComparison.Ordinal)) continue;
+                            var parameters = m.GetParameters();
+                            if (parameters.Length != args.Length) continue;
+                            method = m;
+                            break;
+                        }
+                    }
+
+                    if (method == null) return false;
+                    method.Invoke(target, args);
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+        }
 
         private static string BuildNiceName(SmartctlScanOpenResult.Device d)
         {
