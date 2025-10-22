@@ -57,6 +57,7 @@ namespace FanControl.Smartctl
 
         public void Load(IPluginSensorsContainer container)
         {
+            _sensors.Clear();
             var scan = RunSmartctl("--scan-open -j", TimeSpan.FromSeconds(4));
             if (scan.ExitCode != 0)
             {
@@ -83,6 +84,7 @@ namespace FanControl.Smartctl
                 return;
             }
 
+            var added = 0;
             foreach (var dev in devices)
             {
                 if (dev.Type != null && dev.Type.Contains("nvme", StringComparison.OrdinalIgnoreCase))
@@ -104,11 +106,14 @@ namespace FanControl.Smartctl
                     smartctlPath: _smartctlPath
                 );
 
-                _sensors.Add(sensor);
-                RegisterSensor(container, sensor);
+                if (RegisterSensor(container, sensor))
+                {
+                    _sensors.Add(sensor);
+                    added++;
+                }
             }
 
-            _log?.Log($"[Smartctl] added sensors: {_sensors.Count}");
+            _log?.Log($"[Smartctl] added sensors: {added}");
         }
 
         public void Update()
@@ -128,36 +133,90 @@ namespace FanControl.Smartctl
 
         public void Close() { }
 
-        private void RegisterSensor(IPluginSensorsContainer container, IPluginSensor sensor)
+        private bool RegisterSensor(IPluginSensorsContainer container, IPluginSensor sensor)
         {
             try
             {
                 var containerType = container.GetType();
 
-                var tempsProp = containerType.GetProperty("Temperatures");
-                if (tempsProp?.GetValue(container) is IList list)
+                foreach (var propertyName in new[] { "TempSensors", "TemperatureSensors", "Temperatures" })
                 {
-                    list.Add(sensor);
-                    return;
+                    var property = containerType.GetProperty(propertyName);
+                    if (property == null) continue;
+                    if (TryAddToCollection(property.GetValue(container), sensor)) return true;
                 }
 
-                static bool TryInvoke(IPluginSensorsContainer target, string methodName, IPluginSensor sensor)
-                {
-                    var method = target.GetType().GetMethod(methodName, new[] { typeof(IPluginSensor) });
-                    if (method == null) return false;
-                    method.Invoke(target, new object?[] { sensor });
-                    return true;
-                }
-
-                if (TryInvoke(container, "AddTemperatureSensor", sensor)) return;
-                if (TryInvoke(container, "AddSensor", sensor)) return;
-                if (TryInvoke(container, "RegisterSensor", sensor)) return;
+                if (TryInvoke(container, "AddTempSensor", sensor)) return true;
+                if (TryInvoke(container, "AddTemperatureSensor", sensor)) return true;
+                if (TryInvoke(container, "AddSensor", sensor)) return true;
+                if (TryInvoke(container, "RegisterSensor", sensor)) return true;
 
                 _log?.Log("[Smartctl] unable to register smartctl sensor: unsupported container API");
             }
             catch (Exception ex)
             {
                 _log?.Log($"[Smartctl] failed to register smartctl sensor: {ex}");
+            }
+            return false;
+
+            static bool TryInvoke(IPluginSensorsContainer target, string methodName, IPluginSensor sensor)
+            {
+                var methods = target.GetType().GetMethods();
+                foreach (var method in methods)
+                {
+                    if (!string.Equals(method.Name, methodName, StringComparison.Ordinal)) continue;
+                    var parameters = method.GetParameters();
+                    if (parameters.Length != 1) continue;
+                    var parameterType = parameters[0].ParameterType;
+                    if (!parameterType.IsInstanceOfType(sensor) && !parameterType.IsAssignableFrom(sensor.GetType()) && parameterType != typeof(object))
+                        continue;
+
+                    method.Invoke(target, new object?[] { sensor });
+                    return true;
+                }
+
+                return false;
+            }
+
+            static bool TryAddToCollection(object? target, IPluginSensor sensor)
+            {
+                if (target is null) return false;
+
+                if (target is IList list)
+                {
+                    list.Add(sensor);
+                    return true;
+                }
+
+                var targetType = target.GetType();
+                foreach (var method in targetType.GetMethods())
+                {
+                    if (!string.Equals(method.Name, "Add", StringComparison.Ordinal)) continue;
+                    var parameters = method.GetParameters();
+
+                    if (parameters.Length == 1)
+                    {
+                        var parameterType = parameters[0].ParameterType;
+                        if (!parameterType.IsInstanceOfType(sensor) && !parameterType.IsAssignableFrom(sensor.GetType()) && parameterType != typeof(object))
+                            continue;
+
+                        method.Invoke(target, new object?[] { sensor });
+                        return true;
+                    }
+
+                    if (parameters.Length == 2 && parameters[0].ParameterType == typeof(string))
+                    {
+                        var valueType = parameters[1].ParameterType;
+                        if (!valueType.IsInstanceOfType(sensor) && !valueType.IsAssignableFrom(sensor.GetType()) && valueType != typeof(object))
+                            continue;
+
+                        var key = sensor.Id ?? sensor.Name ?? Guid.NewGuid().ToString("N");
+                        method.Invoke(target, new object?[] { key, sensor });
+                        return true;
+                    }
+                }
+
+                return false;
             }
         }
 
