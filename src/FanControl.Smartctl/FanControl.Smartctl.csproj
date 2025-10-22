@@ -8,6 +8,7 @@
     <Platforms>x64</Platforms>
     <LangVersion>latest</LangVersion>
     <Deterministic>true</Deterministic>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
   </PropertyGroup>
 
   <ItemGroup>
