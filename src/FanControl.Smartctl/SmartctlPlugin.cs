@@ -24,7 +24,12 @@ namespace FanControl.Smartctl
     {
         private readonly IPluginLogger? _log;
         private readonly IPluginDialog? _dialog;
-        private readonly List<SmartctlTempSensor> _sensors = new();
+        private readonly List<SmartctlTempSensor> _physicalSensors = new();
+        private readonly List<AggregateTemperatureSensor> _cageSensors = new();
+        private readonly List<AggregateTemperatureSensor> _caseSensors = new();
+        private readonly List<SensorInfo> _sensorInfos = new();
+        private readonly List<VirtualCageConfig> _cageConfigs = new();
+        private readonly List<VirtualCaseConfig> _caseConfigs = new();
         private DateTime _lastPoll = DateTime.MinValue;
 
         // Configuration
@@ -51,6 +56,8 @@ namespace FanControl.Smartctl
             _displayNamePrefix = null;
             _displayNameSuffix = null;
             _excludedTokens.Clear();
+            _cageConfigs.Clear();
+            _caseConfigs.Clear();
 
             try
             {
@@ -77,6 +84,22 @@ namespace FanControl.Smartctl
                                     _excludedTokens.Add(token.Trim());
                             }
                         }
+                        if (json.Cages != null)
+                        {
+                            foreach (var cage in json.Cages)
+                            {
+                                if (cage != null)
+                                    _cageConfigs.Add(cage);
+                            }
+                        }
+                        if (json.Cases != null)
+                        {
+                            foreach (var virtualCase in json.Cases)
+                            {
+                                if (virtualCase != null)
+                                    _caseConfigs.Add(virtualCase);
+                            }
+                        }
                     }
                 }
             }
@@ -88,7 +111,10 @@ namespace FanControl.Smartctl
 
         public void Load(IPluginSensorsContainer container)
         {
-            _sensors.Clear();
+            _physicalSensors.Clear();
+            _sensorInfos.Clear();
+            _cageSensors.Clear();
+            _caseSensors.Clear();
             var scan = RunSmartctl("--scan-open -j", TimeSpan.FromSeconds(4));
             if (scan.ExitCode != 0)
             {
@@ -165,12 +191,23 @@ namespace FanControl.Smartctl
 
                 if (RegisterSensor(container, sensor))
                 {
-                    _sensors.Add(sensor);
+                    _physicalSensors.Add(sensor);
+                    _sensorInfos.Add(new SensorInfo(metadata, sensor));
                     added++;
                 }
             }
 
-            _log?.Log($"[Smartctl] added sensors: {added}");
+            var (cageCount, caseCount) = CreateVirtualSensors(container);
+
+            if (cageCount > 0 || caseCount > 0)
+            {
+                _log?.Log(
+                    $"[Smartctl] added sensors: {added} disks, {_cageSensors.Count} cage metrics ({cageCount} cages), {_caseSensors.Count} case metrics ({caseCount} cases)");
+            }
+            else
+            {
+                _log?.Log($"[Smartctl] added sensors: {added}");
+            }
         }
 
         public void Update()
@@ -178,7 +215,7 @@ namespace FanControl.Smartctl
             if ((DateTime.UtcNow - _lastPoll) < _pollInterval) return;
             _lastPoll = DateTime.UtcNow;
 
-            foreach (var s in _sensors)
+            foreach (var s in _physicalSensors)
             {
                 try { s.RefreshOnce(); }
                 catch (Exception ex)
@@ -186,9 +223,373 @@ namespace FanControl.Smartctl
                     _log?.Log($"[Smartctl] update failed for {s.Identifier}: {ex.Message}");
                 }
             }
+
+            foreach (var sensor in _cageSensors)
+            {
+                try { sensor.Update(); }
+                catch (Exception ex)
+                {
+                    _log?.Log($"[Smartctl] update failed for {sensor.Identifier}: {ex.Message}");
+                }
+            }
+
+            foreach (var sensor in _caseSensors)
+            {
+                try { sensor.Update(); }
+                catch (Exception ex)
+                {
+                    _log?.Log($"[Smartctl] update failed for {sensor.Identifier}: {ex.Message}");
+                }
+            }
         }
 
         public void Close() { }
+
+        private (int CageCount, int CaseCount) CreateVirtualSensors(IPluginSensorsContainer container)
+        {
+            if (_cageConfigs.Count == 0 && _caseConfigs.Count == 0) return (0, 0);
+
+            var cages = BuildVirtualCages(container);
+            var caseCount = BuildVirtualCases(container, cages);
+
+            return (cages.Count, caseCount);
+        }
+
+        private Dictionary<string, VirtualCage> BuildVirtualCages(IPluginSensorsContainer container)
+        {
+            var result = new Dictionary<string, VirtualCage>(StringComparer.OrdinalIgnoreCase);
+            if (_cageConfigs.Count == 0) return result;
+
+            foreach (var config in _cageConfigs)
+            {
+                if (config is null) continue;
+
+                var name = config.Name?.Trim();
+                if (string.IsNullOrWhiteSpace(name))
+                {
+                    _log?.Log("[Smartctl] skipping virtual cage with empty name.");
+                    continue;
+                }
+
+                if (result.ContainsKey(name))
+                {
+                    _log?.Log($"[Smartctl] duplicate virtual cage '{name}' - skipping.");
+                    continue;
+                }
+
+                var members = ResolveDiskSensors(config.Disks, name);
+                if (members.Count == 0)
+                {
+                    _log?.Log($"[Smartctl] cage '{name}' has no matching disks; skipping.");
+                    continue;
+                }
+
+                var valueProviders = CreateValueProviders(members, sensor => sensor.Value);
+
+                var minSensor = CreateAggregateSensor("Cage", "cage", name, AggregationMode.Min, valueProviders);
+                if (!RegisterAggregateSensor(container, minSensor, _cageSensors)) continue;
+
+                var maxSensor = CreateAggregateSensor("Cage", "cage", name, AggregationMode.Max, valueProviders);
+                if (!RegisterAggregateSensor(container, maxSensor, _cageSensors)) continue;
+
+                var averageSensor = CreateAggregateSensor("Cage", "cage", name, AggregationMode.Average, valueProviders);
+                if (!RegisterAggregateSensor(container, averageSensor, _cageSensors)) continue;
+
+                result[name] = new VirtualCage(name, minSensor, maxSensor, averageSensor);
+            }
+
+            return result;
+        }
+
+        private int BuildVirtualCases(IPluginSensorsContainer container, IReadOnlyDictionary<string, VirtualCage> cages)
+        {
+            if (_caseConfigs.Count == 0) return 0;
+
+            var created = 0;
+            var comparer = StringComparer.OrdinalIgnoreCase;
+
+            foreach (var config in _caseConfigs)
+            {
+                if (config is null) continue;
+
+                var name = config.Name?.Trim();
+                if (string.IsNullOrWhiteSpace(name))
+                {
+                    _log?.Log("[Smartctl] skipping virtual case with empty name.");
+                    continue;
+                }
+
+                var selected = new List<VirtualCage>();
+                var seen = new HashSet<string>(comparer);
+
+                if (config.Cages != null)
+                {
+                    foreach (var cageName in config.Cages)
+                    {
+                        var trimmed = cageName?.Trim();
+                        if (string.IsNullOrWhiteSpace(trimmed)) continue;
+
+                        if (!cages.TryGetValue(trimmed, out var cage))
+                        {
+                            _log?.Log($"[Smartctl] case '{name}' references unknown cage '{trimmed}'.");
+                            continue;
+                        }
+
+                        if (seen.Add(cage.Name))
+                        {
+                            selected.Add(cage);
+                        }
+                    }
+                }
+
+                if (selected.Count == 0)
+                {
+                    _log?.Log($"[Smartctl] case '{name}' has no matching cages; skipping.");
+                    continue;
+                }
+
+                var minSensor = CreateAggregateSensor(
+                    "Case",
+                    "case",
+                    name,
+                    AggregationMode.Min,
+                    CreateValueProviders(selected, cage => cage.MinSensor.Value));
+                if (!RegisterAggregateSensor(container, minSensor, _caseSensors)) continue;
+
+                var maxSensor = CreateAggregateSensor(
+                    "Case",
+                    "case",
+                    name,
+                    AggregationMode.Max,
+                    CreateValueProviders(selected, cage => cage.MaxSensor.Value));
+                if (!RegisterAggregateSensor(container, maxSensor, _caseSensors)) continue;
+
+                var averageSensor = CreateAggregateSensor(
+                    "Case",
+                    "case",
+                    name,
+                    AggregationMode.Average,
+                    CreateValueProviders(selected, cage => cage.AverageSensor.Value));
+                if (!RegisterAggregateSensor(container, averageSensor, _caseSensors)) continue;
+
+                created++;
+            }
+
+            return created;
+        }
+
+        private List<SmartctlTempSensor> ResolveDiskSensors(IEnumerable<string>? tokens, string cageName)
+        {
+            var result = new List<SmartctlTempSensor>();
+            if (tokens is null) return result;
+
+            var seen = new HashSet<SmartctlTempSensor>();
+
+            foreach (var token in tokens)
+            {
+                var trimmed = token?.Trim();
+                if (string.IsNullOrWhiteSpace(trimmed)) continue;
+
+                var matchedAny = false;
+
+                foreach (var info in _sensorInfos)
+                {
+                    if (!Matches(info.Metadata, trimmed) && !SensorMatches(info.Sensor, trimmed)) continue;
+
+                    if (seen.Add(info.Sensor))
+                    {
+                        result.Add(info.Sensor);
+                    }
+
+                    matchedAny = true;
+                }
+
+                if (!matchedAny)
+                {
+                    _log?.Log($"[Smartctl] cage '{cageName}' token '{trimmed}' did not match any disks.");
+                }
+            }
+
+            return result;
+        }
+
+        private static bool SensorMatches(SmartctlTempSensor sensor, string token)
+        {
+            if (string.IsNullOrWhiteSpace(token)) return false;
+
+            if (!string.IsNullOrWhiteSpace(sensor.Identifier) &&
+                sensor.Identifier.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return true;
+            }
+
+            return sensor.Name.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static List<Func<float?>> CreateValueProviders<T>(IEnumerable<T> items, Func<T, float?> selector)
+        {
+            var providers = new List<Func<float?>>();
+
+            foreach (var item in items)
+            {
+                var local = item;
+                providers.Add(() => selector(local));
+            }
+
+            return providers;
+        }
+
+        private static AggregateTemperatureSensor CreateAggregateSensor(
+            string displayGroup,
+            string identifierGroup,
+            string groupName,
+            AggregationMode mode,
+            IReadOnlyList<Func<float?>> providers)
+        {
+            var suffixDisplay = mode switch
+            {
+                AggregationMode.Min => "Min",
+                AggregationMode.Max => "Max",
+                AggregationMode.Average => "Average",
+                _ => "Value"
+            };
+
+            var suffixId = mode switch
+            {
+                AggregationMode.Min => "min",
+                AggregationMode.Max => "max",
+                AggregationMode.Average => "avg",
+                _ => "value"
+            };
+
+            var name = $"{displayGroup} {groupName} {suffixDisplay}";
+            var identifier = $"smartctl://virtual/{identifierGroup}/{Slugify(groupName)}/{suffixId}";
+
+            return new AggregateTemperatureSensor(name, identifier, mode, providers);
+        }
+
+        private bool RegisterAggregateSensor(IPluginSensorsContainer container, AggregateTemperatureSensor sensor, List<AggregateTemperatureSensor> target)
+        {
+            if (!RegisterSensor(container, sensor))
+            {
+                _log?.Log($"[Smartctl] unable to register virtual sensor '{sensor.Name}'");
+                return false;
+            }
+
+            target.Add(sensor);
+            return true;
+        }
+
+        private static string Slugify(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return "group";
+
+            var lower = value.Trim().ToLowerInvariant();
+            var slug = Regex.Replace(lower, @"[^\w]+", "-", RegexOptions.CultureInvariant);
+            slug = slug.Trim('-');
+
+            return string.IsNullOrWhiteSpace(slug) ? "group" : slug;
+        }
+
+        private sealed class VirtualCage
+        {
+            public VirtualCage(string name, AggregateTemperatureSensor minSensor, AggregateTemperatureSensor maxSensor, AggregateTemperatureSensor averageSensor)
+            {
+                Name = name;
+                MinSensor = minSensor;
+                MaxSensor = maxSensor;
+                AverageSensor = averageSensor;
+            }
+
+            public string Name { get; }
+            public AggregateTemperatureSensor MinSensor { get; }
+            public AggregateTemperatureSensor MaxSensor { get; }
+            public AggregateTemperatureSensor AverageSensor { get; }
+        }
+
+        private sealed class SensorInfo
+        {
+            public SensorInfo(DeviceMetadata metadata, SmartctlTempSensor sensor)
+            {
+                Metadata = metadata;
+                Sensor = sensor;
+            }
+
+            public DeviceMetadata Metadata { get; }
+            public SmartctlTempSensor Sensor { get; }
+        }
+
+        private enum AggregationMode
+        {
+            Min,
+            Max,
+            Average
+        }
+
+        private sealed class AggregateTemperatureSensor : IPluginSensor
+        {
+            private readonly IReadOnlyList<Func<float?>> _valueProviders;
+            private readonly AggregationMode _mode;
+
+            public AggregateTemperatureSensor(string name, string identifier, AggregationMode mode, IReadOnlyList<Func<float?>> valueProviders)
+            {
+                Name = name;
+                Identifier = identifier;
+                _mode = mode;
+                _valueProviders = valueProviders?.ToArray() ?? Array.Empty<Func<float?>>();
+            }
+
+            public string Name { get; }
+            public string Identifier { get; }
+            public string Id => Identifier;
+            public float? Value { get; private set; }
+
+            public void Update()
+            {
+                float min = float.PositiveInfinity;
+                float max = float.NegativeInfinity;
+                float sum = 0f;
+                var count = 0;
+
+                foreach (var provider in _valueProviders)
+                {
+                    if (provider is null) continue;
+
+                    float? value;
+                    try
+                    {
+                        value = provider();
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    if (!value.HasValue) continue;
+                    var current = value.Value;
+                    if (!float.IsFinite(current)) continue;
+
+                    if (current < min) min = current;
+                    if (current > max) max = current;
+                    sum += current;
+                    count++;
+                }
+
+                if (count == 0)
+                {
+                    Value = null;
+                    return;
+                }
+
+                Value = _mode switch
+                {
+                    AggregationMode.Min => min,
+                    AggregationMode.Max => max,
+                    AggregationMode.Average => sum / count,
+                    _ => Value
+                };
+            }
+        }
 
         private void ApplyDisplayNameSettings(DisplayNameConfig? config)
         {
@@ -947,6 +1348,20 @@ namespace FanControl.Smartctl
             [JsonPropertyName("pollSeconds")] public int? PollSeconds { get; set; }
             [JsonPropertyName("displayName")] public DisplayNameConfig? DisplayName { get; set; }
             [JsonPropertyName("excludeDevices")] public List<string>? ExcludeDevices { get; set; }
+            [JsonPropertyName("cages")] public List<VirtualCageConfig>? Cages { get; set; }
+            [JsonPropertyName("cases")] public List<VirtualCaseConfig>? Cases { get; set; }
+        }
+
+        private sealed class VirtualCageConfig
+        {
+            [JsonPropertyName("name")] public string? Name { get; set; }
+            [JsonPropertyName("disks")] public List<string>? Disks { get; set; }
+        }
+
+        private sealed class VirtualCaseConfig
+        {
+            [JsonPropertyName("name")] public string? Name { get; set; }
+            [JsonPropertyName("cages")] public List<string>? Cages { get; set; }
         }
 
         private sealed class DisplayNameConfig

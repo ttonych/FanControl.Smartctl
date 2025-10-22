@@ -46,5 +46,34 @@
   "excludeDevices": [
     "PhysicalDrive5",
     "Some USB"
+  ],
+
+  // Virtual cages let you group multiple disks together.
+  // Each cage exposes Min, Max and Average temperature sensors that aggregate the disks it contains.
+  "cages": [
+    {
+      "name": "Front Cage",
+      "disks": [
+        "PhysicalDrive0",
+        "PhysicalDrive1"
+      ]
+    },
+    {
+      "name": "Rear Cage",
+      "disks": [
+        "PhysicalDrive2"
+      ]
+    }
+  ],
+
+  // Virtual cases combine cages. Case sensors aggregate the selected cages.
+  "cases": [
+    {
+      "name": "Main Case",
+      "cages": [
+        "Front Cage",
+        "Rear Cage"
+      ]
+    }
   ]
 }
