@@ -3,10 +3,15 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using System.Threading;
+#if WINDOWS
+using System.Management;
+#endif
 using FanControl.Plugins;
 
 namespace FanControl.Smartctl
@@ -24,6 +29,11 @@ namespace FanControl.Smartctl
         // Configuration
         private string _smartctlPath = "smartctl";
         private TimeSpan _pollInterval = TimeSpan.FromSeconds(10);
+        private DisplayNameMode _displayNameMode = DisplayNameMode.Auto;
+        private string? _displayNameFormat;
+        private string? _displayNamePrefix;
+        private string? _displayNameSuffix;
+        private readonly List<string> _excludedTokens = new();
 
         public SmartctlPlugin(IPluginLogger? logger = null, IPluginDialog? dialog = null)
         {
@@ -35,6 +45,12 @@ namespace FanControl.Smartctl
 
         public void Initialize()
         {
+            _displayNameMode = DisplayNameMode.Auto;
+            _displayNameFormat = null;
+            _displayNamePrefix = null;
+            _displayNameSuffix = null;
+            _excludedTokens.Clear();
+
             try
             {
                 var dllDir = Path.GetDirectoryName(typeof(SmartctlPlugin).Assembly.Location)!;
@@ -46,6 +62,15 @@ namespace FanControl.Smartctl
                     {
                         if (!string.IsNullOrWhiteSpace(json.SmartctlPath)) _smartctlPath = json.SmartctlPath!;
                         if (json.PollSeconds is > 0) _pollInterval = TimeSpan.FromSeconds(json.PollSeconds.Value);
+                        ApplyDisplayNameSettings(json.DisplayName);
+                        if (json.ExcludeDevices != null)
+                        {
+                            foreach (var token in json.ExcludeDevices)
+                            {
+                                if (!string.IsNullOrWhiteSpace(token))
+                                    _excludedTokens.Add(token.Trim());
+                            }
+                        }
                     }
                 }
             }
@@ -84,6 +109,9 @@ namespace FanControl.Smartctl
                 return;
             }
 
+#if WINDOWS
+            var windowsDisks = WindowsDiskEnumerator.TryCollect(_log);
+#endif
             var added = 0;
             foreach (var dev in devices)
             {
@@ -108,11 +136,23 @@ namespace FanControl.Smartctl
                     _log?.Log($"[Smartctl] skipping {deviceId}: unable to resolve device path");
                     continue;
                 }
+#if WINDOWS
+                var metadata = CreateDeviceMetadata(dev, deviceId, devicePath, windowsDisks);
+#else
+                var metadata = CreateDeviceMetadata(dev, deviceId, devicePath);
+#endif
+
+                if (ShouldExcludeDevice(metadata))
+                {
+                    _log?.Log($"[Smartctl] skipping {metadata.DeviceToken}: excluded by config");
+                    continue;
+                }
+
                 var sensor = new SmartctlTempSensor(
-                    device: deviceId,
-                    devicePath: devicePath,
-                    devTypeArg: dev.Type ?? "auto",
-                    displayName: BuildNiceName(dev),
+                    device: metadata.DeviceToken,
+                    devicePath: metadata.DevicePath,
+                    devTypeArg: metadata.TypeArgument,
+                    displayName: BuildDisplayName(metadata),
                     logger: _log,
                     smartctlPath: _smartctlPath
                 );
@@ -143,6 +183,360 @@ namespace FanControl.Smartctl
         }
 
         public void Close() { }
+
+        private void ApplyDisplayNameSettings(DisplayNameConfig? config)
+        {
+            if (config is null) return;
+
+            if (!string.IsNullOrWhiteSpace(config.Mode))
+            {
+                if (Enum.TryParse(config.Mode, true, out DisplayNameMode parsed))
+                {
+                    _displayNameMode = parsed;
+                }
+                else
+                {
+                    _log?.Log($"[Smartctl] unknown displayName.mode '{config.Mode}' - using {_displayNameMode}");
+                }
+            }
+
+            _displayNameFormat = string.IsNullOrWhiteSpace(config.Format) ? null : config.Format;
+            _displayNamePrefix = string.IsNullOrWhiteSpace(config.Prefix) ? null : config.Prefix;
+            _displayNameSuffix = string.IsNullOrWhiteSpace(config.Suffix) ? null : config.Suffix;
+        }
+
+#if WINDOWS
+        private DeviceMetadata CreateDeviceMetadata(SmartctlScanOpenResult.Device device, string deviceToken, string devicePath, IReadOnlyList<WindowsDiskInfo> windowsDisks)
+#else
+        private DeviceMetadata CreateDeviceMetadata(SmartctlScanOpenResult.Device device, string deviceToken, string devicePath)
+#endif
+        {
+            var metadata = new DeviceMetadata
+            {
+                DeviceToken = deviceToken,
+                DevicePath = devicePath,
+                TypeArgument = string.IsNullOrWhiteSpace(device.Type) ? "auto" : device.Type!.Trim(),
+                Name = device.Name,
+                InfoName = device.Info_Name,
+                OpenDevice = device.Open_Device
+            };
+
+            PopulateFromSmartctlInfo(metadata);
+
+#if WINDOWS
+            if (windowsDisks.Count > 0)
+            {
+                TryAttachWindowsInfo(metadata, windowsDisks);
+            }
+#endif
+
+            return metadata;
+        }
+
+        private void PopulateFromSmartctlInfo(DeviceMetadata metadata)
+        {
+            try
+            {
+                var args = $"-i -j -d {metadata.TypeArgument} \"{metadata.DevicePath}\"";
+                var (exitCode, stdOut, stdErr) = RunSmartctl(args, TimeSpan.FromSeconds(4));
+
+                if (!string.IsNullOrWhiteSpace(stdOut))
+                {
+                    using var doc = JsonDocument.Parse(stdOut);
+                    var root = doc.RootElement;
+                    metadata.Model = TryGetInfoString(root, "model_name", "device_model", "model_family", "product", "nvme_model_number", "scsi_product") ?? metadata.Model;
+                    metadata.SerialNumber = TryGetInfoString(root, "serial_number", "ata_serial_number", "nvme_serial_number", "scsi_serial_number") ?? metadata.SerialNumber;
+                    metadata.Firmware = TryGetInfoString(root, "firmware_version", "firmware_revision", "nvme_firmware_version", "scsi_firmware_version") ?? metadata.Firmware;
+                }
+                else if (exitCode != 0)
+                {
+                    _log?.Log($"[Smartctl] info query failed for {metadata.DevicePath}: {stdErr}");
+                }
+            }
+            catch (Exception ex)
+            {
+                _log?.Log($"[Smartctl] failed to inspect {metadata.DevicePath}: {ex.Message}");
+            }
+        }
+
+        private static string? TryGetInfoString(JsonElement root, params string[] propertyNames)
+        {
+            foreach (var property in propertyNames)
+            {
+                if (!root.TryGetProperty(property, out var value)) continue;
+                if (value.ValueKind != JsonValueKind.String) continue;
+                var str = value.GetString();
+                if (!string.IsNullOrWhiteSpace(str)) return str;
+            }
+
+            return null;
+        }
+
+#if WINDOWS
+        private static void TryAttachWindowsInfo(DeviceMetadata metadata, IReadOnlyList<WindowsDiskInfo> windowsDisks)
+        {
+            WindowsDiskInfo? match = null;
+
+            if (!string.IsNullOrWhiteSpace(metadata.SerialNumber))
+            {
+                var serial = NormalizeSerial(metadata.SerialNumber);
+                match = windowsDisks.FirstOrDefault(d => !string.IsNullOrWhiteSpace(d.Serial) && NormalizeSerial(d.Serial!) == serial);
+            }
+
+            if (match == null)
+            {
+                var candidate = NormalizeWindowsDeviceId(metadata.DevicePath);
+                if (!string.IsNullOrWhiteSpace(candidate))
+                {
+                    match = windowsDisks.FirstOrDefault(d => string.Equals(NormalizeWindowsDeviceId(d.DeviceId), candidate, StringComparison.OrdinalIgnoreCase));
+                }
+            }
+
+            if (match == null && !string.IsNullOrWhiteSpace(metadata.OpenDevice))
+            {
+                var candidate = NormalizeWindowsDeviceId(metadata.OpenDevice);
+                if (!string.IsNullOrWhiteSpace(candidate))
+                {
+                    match = windowsDisks.FirstOrDefault(d => string.Equals(NormalizeWindowsDeviceId(d.DeviceId), candidate, StringComparison.OrdinalIgnoreCase));
+                }
+            }
+
+            if (match == null && !string.IsNullOrWhiteSpace(metadata.InfoName))
+            {
+                var candidate = NormalizeWindowsDeviceId(metadata.InfoName);
+                if (!string.IsNullOrWhiteSpace(candidate))
+                {
+                    match = windowsDisks.FirstOrDefault(d => string.Equals(NormalizeWindowsDeviceId(d.DeviceId), candidate, StringComparison.OrdinalIgnoreCase));
+                }
+            }
+
+            if (match == null) return;
+
+            metadata.WindowsDeviceId = match.DeviceId;
+            metadata.WindowsFriendlyName = match.FriendlyName;
+
+            if (string.IsNullOrWhiteSpace(metadata.Model) && !string.IsNullOrWhiteSpace(match.Model))
+            {
+                metadata.Model = match.Model;
+            }
+
+            if (string.IsNullOrWhiteSpace(metadata.SerialNumber) && !string.IsNullOrWhiteSpace(match.Serial))
+            {
+                metadata.SerialNumber = match.Serial;
+            }
+
+            foreach (var letter in match.DriveLetters)
+            {
+                if (string.IsNullOrWhiteSpace(letter)) continue;
+                if (!metadata.DriveLetters.Any(l => string.Equals(l, letter, StringComparison.OrdinalIgnoreCase)))
+                {
+                    metadata.DriveLetters.Add(letter);
+                }
+            }
+
+            if (metadata.DriveLetters.Count > 1)
+            {
+                metadata.DriveLetters.Sort(StringComparer.OrdinalIgnoreCase);
+            }
+        }
+
+        private static string NormalizeWindowsDeviceId(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return string.Empty;
+            var trimmed = value.Trim();
+            trimmed = trimmed.Replace('/', '\\');
+
+            if (trimmed.StartsWith(@"\\.\", StringComparison.OrdinalIgnoreCase))
+            {
+                return trimmed;
+            }
+
+            var physical = Regex.Match(trimmed, @"PhysicalDrive(\d+)", RegexOptions.IgnoreCase);
+            if (physical.Success)
+            {
+                return @$"\\.\PHYSICALDRIVE{physical.Groups[1].Value}";
+            }
+
+            var pd = Regex.Match(trimmed, @"PD(\d+)", RegexOptions.IgnoreCase);
+            if (pd.Success)
+            {
+                return @$"\\.\PHYSICALDRIVE{pd.Groups[1].Value}";
+            }
+
+            return trimmed;
+        }
+
+        private static string NormalizeSerial(string value)
+        {
+            var cleaned = Regex.Replace(value.Trim(), @"\s+", string.Empty);
+            return cleaned.ToUpperInvariant();
+        }
+#endif
+
+        private bool ShouldExcludeDevice(DeviceMetadata metadata)
+        {
+            if (_excludedTokens.Count == 0) return false;
+
+            foreach (var token in _excludedTokens)
+            {
+                if (Matches(metadata, token)) return true;
+            }
+
+            return false;
+        }
+
+        private static bool Matches(DeviceMetadata metadata, string token)
+        {
+            if (string.IsNullOrWhiteSpace(token)) return false;
+
+            bool Match(string? value) => !string.IsNullOrWhiteSpace(value) && value.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0;
+
+            if (Match(metadata.DeviceToken)) return true;
+            if (Match(metadata.DevicePath)) return true;
+            if (Match(metadata.SerialNumber)) return true;
+            if (Match(metadata.Model)) return true;
+            if (Match(metadata.Name)) return true;
+            if (Match(metadata.InfoName)) return true;
+            if (Match(metadata.OpenDevice)) return true;
+            if (Match(metadata.WindowsDeviceId)) return true;
+            if (Match(metadata.WindowsFriendlyName)) return true;
+            if (metadata.DriveLetters.Any(Match)) return true;
+
+            return false;
+        }
+
+        private string BuildDisplayName(DeviceMetadata metadata)
+        {
+            string? result = null;
+
+            if (!string.IsNullOrWhiteSpace(_displayNameFormat))
+            {
+                result = ApplyDisplayNameFormat(_displayNameFormat!, metadata);
+            }
+
+            if (string.IsNullOrWhiteSpace(result))
+            {
+                result = _displayNameMode switch
+                {
+                    DisplayNameMode.Device => ChooseDeviceToken(metadata),
+                    DisplayNameMode.DeviceAndType => $"{ChooseDeviceToken(metadata)} ({metadata.TypeArgument})",
+                    DisplayNameMode.Model => metadata.Model ?? metadata.WindowsFriendlyName ?? ChooseDeviceToken(metadata),
+                    DisplayNameMode.Serial => metadata.SerialNumber ?? ChooseDeviceToken(metadata),
+                    DisplayNameMode.ModelAndSerial => CombineNonEmpty(metadata.Model ?? metadata.WindowsFriendlyName, metadata.SerialNumber)
+                                                        ?? CombineNonEmpty(metadata.Model ?? metadata.WindowsFriendlyName, ChooseDeviceToken(metadata)),
+                    DisplayNameMode.DriveLetters => metadata.DriveLetters.Count > 0 ? $"Disk {string.Join(", ", metadata.DriveLetters)}" : null,
+                    DisplayNameMode.ModelAndDriveLetters => BuildModelWithLetters(metadata),
+                    _ => null
+                };
+            }
+
+            if (string.IsNullOrWhiteSpace(result))
+            {
+                result = BuildDefaultDisplayName(metadata);
+            }
+
+            if (!string.IsNullOrWhiteSpace(_displayNamePrefix))
+            {
+                result = _displayNamePrefix + result;
+            }
+
+            if (!string.IsNullOrWhiteSpace(_displayNameSuffix))
+            {
+                result += _displayNameSuffix;
+            }
+
+            return result;
+        }
+
+        private static string ApplyDisplayNameFormat(string format, DeviceMetadata metadata)
+        {
+            var replacements = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["device"] = metadata.DeviceToken,
+                ["devicePath"] = metadata.DevicePath,
+                ["type"] = metadata.TypeArgument,
+                ["model"] = metadata.Model ?? metadata.WindowsFriendlyName,
+                ["serial"] = metadata.SerialNumber,
+                ["letters"] = metadata.DriveLetters.Count > 0 ? string.Join(", ", metadata.DriveLetters) : null,
+                ["name"] = metadata.Name,
+                ["info"] = metadata.InfoName,
+                ["openDevice"] = metadata.OpenDevice,
+                ["windowsDeviceId"] = metadata.WindowsDeviceId,
+                ["friendly"] = metadata.WindowsFriendlyName,
+                ["firmware"] = metadata.Firmware
+            };
+
+            var sb = new StringBuilder();
+            for (var i = 0; i < format.Length;)
+            {
+                var open = format.IndexOf('{', i);
+                if (open < 0)
+                {
+                    sb.Append(format, i, format.Length - i);
+                    break;
+                }
+
+                sb.Append(format, i, open - i);
+                var close = format.IndexOf('}', open + 1);
+                if (close < 0)
+                {
+                    sb.Append(format, open, format.Length - open);
+                    break;
+                }
+
+                var token = format.Substring(open + 1, close - open - 1).Trim();
+                if (token.Length > 0 && replacements.TryGetValue(token, out var value) && !string.IsNullOrWhiteSpace(value))
+                {
+                    sb.Append(value);
+                }
+
+                i = close + 1;
+            }
+
+            return sb.ToString().Trim();
+        }
+
+        private static string? BuildModelWithLetters(DeviceMetadata metadata)
+        {
+            if (metadata.DriveLetters.Count > 0 && !string.IsNullOrWhiteSpace(metadata.Model ?? metadata.WindowsFriendlyName))
+            {
+                var label = metadata.Model ?? metadata.WindowsFriendlyName;
+                return $"{label} [{string.Join(", ", metadata.DriveLetters)}]";
+            }
+
+            if (metadata.DriveLetters.Count > 0)
+            {
+                return $"Disk {string.Join(", ", metadata.DriveLetters)}";
+            }
+
+            return metadata.Model ?? metadata.WindowsFriendlyName;
+        }
+
+        private static string BuildDefaultDisplayName(DeviceMetadata metadata)
+        {
+            var token = ChooseDeviceToken(metadata);
+            var m = Regex.Match(token, @"PhysicalDrive(\d+)", RegexOptions.IgnoreCase);
+            var pd = m.Success ? $"PD{m.Groups[1].Value}" : token;
+            var type = string.IsNullOrWhiteSpace(metadata.TypeArgument) ? "auto" : metadata.TypeArgument;
+            return $"Disk {pd} ({type})";
+        }
+
+        private static string ChooseDeviceToken(DeviceMetadata metadata)
+        {
+            if (!string.IsNullOrWhiteSpace(metadata.DevicePath)) return metadata.DevicePath;
+            if (!string.IsNullOrWhiteSpace(metadata.DeviceToken)) return metadata.DeviceToken;
+            if (!string.IsNullOrWhiteSpace(metadata.OpenDevice)) return metadata.OpenDevice!;
+            if (!string.IsNullOrWhiteSpace(metadata.InfoName)) return metadata.InfoName!;
+            if (!string.IsNullOrWhiteSpace(metadata.Name)) return metadata.Name!;
+            return "Disk";
+        }
+
+        private static string? CombineNonEmpty(params string?[] values)
+        {
+            var parts = values.Where(v => !string.IsNullOrWhiteSpace(v)).Select(v => v!.Trim()).ToArray();
+            return parts.Length == 0 ? null : string.Join(" - ", parts);
+        }
+
 
         private bool RegisterSensor(IPluginSensorsContainer container, IPluginSensor sensor)
         {
@@ -285,16 +679,6 @@ namespace FanControl.Smartctl
             }
         }
 
-        private static string BuildNiceName(SmartctlScanOpenResult.Device d)
-        {
-            var src = SelectDevicePath(d.Name, d.Open_Device, d.Info_Name);
-            if (string.IsNullOrWhiteSpace(src)) src = "Disk";
-            var m = Regex.Match(src, @"PhysicalDrive(\d+)", RegexOptions.IgnoreCase);
-            var pd = m.Success ? $"PD{m.Groups[1].Value}" : src;
-            var type = d.Type ?? "auto";
-            return $"Disk {pd} ({type})";
-        }
-
         private static string SelectDevicePath(params string?[] candidates)
         {
             foreach (var candidate in candidates)
@@ -385,10 +769,130 @@ namespace FanControl.Smartctl
             return (p.ExitCode, so, se);
         }
 
+        private enum DisplayNameMode
+        {
+            Auto,
+            Device,
+            DeviceAndType,
+            Model,
+            Serial,
+            ModelAndSerial,
+            DriveLetters,
+            ModelAndDriveLetters
+        }
+
+        private sealed class DeviceMetadata
+        {
+            public string DeviceToken { get; set; } = string.Empty;
+            public string DevicePath { get; set; } = string.Empty;
+            public string TypeArgument { get; set; } = "auto";
+            public string? Name { get; set; }
+            public string? InfoName { get; set; }
+            public string? OpenDevice { get; set; }
+            public string? Model { get; set; }
+            public string? SerialNumber { get; set; }
+            public string? Firmware { get; set; }
+            public string? WindowsDeviceId { get; set; }
+            public string? WindowsFriendlyName { get; set; }
+            public List<string> DriveLetters { get; } = new();
+        }
+
+#if WINDOWS
+        private sealed class WindowsDiskInfo
+        {
+            public string DeviceId { get; init; } = string.Empty;
+            public string? Serial { get; init; }
+            public string? Model { get; init; }
+            public string? FriendlyName { get; init; }
+            public List<string> DriveLetters { get; } = new();
+        }
+
+        private static class WindowsDiskEnumerator
+        {
+            public static IReadOnlyList<WindowsDiskInfo> TryCollect(IPluginLogger? log)
+            {
+                var result = new List<WindowsDiskInfo>();
+
+                if (!OperatingSystem.IsWindows()) return result;
+
+                try
+                {
+                    using var searcher = new ManagementObjectSearcher("SELECT DeviceID, SerialNumber, Model, FriendlyName FROM Win32_DiskDrive");
+                    foreach (ManagementObject disk in searcher.Get())
+                    {
+                        using (disk)
+                        {
+                            var info = new WindowsDiskInfo
+                            {
+                                DeviceId = disk["DeviceID"]?.ToString() ?? string.Empty,
+                                Serial = disk["SerialNumber"]?.ToString(),
+                                Model = disk["Model"]?.ToString(),
+                                FriendlyName = disk["FriendlyName"]?.ToString()
+                            };
+
+                            try
+                            {
+                                foreach (ManagementObject partition in disk.GetRelated("Win32_DiskPartition"))
+                                {
+                                    using (partition)
+                                    {
+                                        foreach (ManagementObject logical in partition.GetRelated("Win32_LogicalDisk"))
+                                        {
+                                            using (logical)
+                                            {
+                                                var letter = logical["DeviceID"]?.ToString();
+                                                if (string.IsNullOrWhiteSpace(letter)) continue;
+                                                if (!info.DriveLetters.Any(l => string.Equals(l, letter, StringComparison.OrdinalIgnoreCase)))
+                                                {
+                                                    info.DriveLetters.Add(letter);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            catch (ManagementException mex)
+                            {
+                                log?.Log($"[Smartctl] failed to enumerate logical disks for {info.DeviceId}: {mex.Message}");
+                            }
+                            catch (Exception ex)
+                            {
+                                log?.Log($"[Smartctl] unexpected error while enumerating logical disks for {info.DeviceId}: {ex.Message}");
+                            }
+
+                            if (info.DriveLetters.Count > 1)
+                            {
+                                info.DriveLetters.Sort(StringComparer.OrdinalIgnoreCase);
+                            }
+
+                            result.Add(info);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    log?.Log($"[Smartctl] failed to enumerate Windows disks: {ex.Message}");
+                }
+
+                return result;
+            }
+        }
+#endif
+
         private sealed class PluginConfig
         {
             [JsonPropertyName("smartctlPath")] public string? SmartctlPath { get; set; }
             [JsonPropertyName("pollSeconds")] public int? PollSeconds { get; set; }
+            [JsonPropertyName("displayName")] public DisplayNameConfig? DisplayName { get; set; }
+            [JsonPropertyName("excludeDevices")] public List<string>? ExcludeDevices { get; set; }
+        }
+
+        private sealed class DisplayNameConfig
+        {
+            [JsonPropertyName("mode")] public string? Mode { get; set; }
+            [JsonPropertyName("format")] public string? Format { get; set; }
+            [JsonPropertyName("prefix")] public string? Prefix { get; set; }
+            [JsonPropertyName("suffix")] public string? Suffix { get; set; }
         }
 
         private sealed class SmartctlScanOpenResult
