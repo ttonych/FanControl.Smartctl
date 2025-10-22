@@ -11,6 +11,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 #if WINDOWS
 using System.Management;
+using System.Runtime.InteropServices;
 #endif
 using FanControl.Plugins;
 
@@ -809,72 +810,129 @@ namespace FanControl.Smartctl
 
         private static class WindowsDiskEnumerator
         {
+            private static readonly string[] s_diskQueries =
+            {
+                "SELECT DeviceID, SerialNumber, Model, FriendlyName FROM Win32_DiskDrive",
+                "SELECT DeviceID, SerialNumber, Model, Caption FROM Win32_DiskDrive"
+            };
+
             public static IReadOnlyList<WindowsDiskInfo> TryCollect(IPluginLogger? log)
+            {
+                if (!OperatingSystem.IsWindows()) return new List<WindowsDiskInfo>();
+
+                foreach (var query in s_diskQueries)
+                {
+                    try
+                    {
+                        var collected = CollectWithQuery(query, log);
+                        if (collected.Count > 0 || query == s_diskQueries[^1])
+                        {
+                            return collected;
+                        }
+                    }
+                    catch (ManagementException mex) when (mex.ErrorCode == ManagementStatus.InvalidQuery)
+                    {
+                        log?.Log($"[Smartctl] disk query not supported: {mex.Message}. Retrying without FriendlyName.");
+                    }
+                    catch (COMException cex)
+                    {
+                        log?.Log($"[Smartctl] failed to enumerate Windows disks: {cex.Message}");
+                        return new List<WindowsDiskInfo>();
+                    }
+                    catch (Exception ex)
+                    {
+                        log?.Log($"[Smartctl] failed to enumerate Windows disks: {ex.Message}");
+                        return new List<WindowsDiskInfo>();
+                    }
+                }
+
+                return new List<WindowsDiskInfo>();
+            }
+
+            private static List<WindowsDiskInfo> CollectWithQuery(string query, IPluginLogger? log)
             {
                 var result = new List<WindowsDiskInfo>();
 
-                if (!OperatingSystem.IsWindows()) return result;
-
-                try
+                using var searcher = new ManagementObjectSearcher(query);
+                using var disks = searcher.Get();
+                foreach (ManagementObject disk in disks)
                 {
-                    using var searcher = new ManagementObjectSearcher("SELECT DeviceID, SerialNumber, Model, FriendlyName FROM Win32_DiskDrive");
-                    foreach (ManagementObject disk in searcher.Get())
+                    using (disk)
                     {
-                        using (disk)
+                        var info = new WindowsDiskInfo
                         {
-                            var info = new WindowsDiskInfo
-                            {
-                                DeviceId = disk["DeviceID"]?.ToString() ?? string.Empty,
-                                Serial = disk["SerialNumber"]?.ToString(),
-                                Model = disk["Model"]?.ToString(),
-                                FriendlyName = disk["FriendlyName"]?.ToString()
-                            };
+                            DeviceId = TryGetPropertyString(disk, "DeviceID") ?? string.Empty,
+                            Serial = TryGetPropertyString(disk, "SerialNumber"),
+                            Model = TryGetPropertyString(disk, "Model"),
+                            FriendlyName = TryGetPropertyString(disk, "FriendlyName") ?? TryGetPropertyString(disk, "Caption")
+                        };
 
-                            try
-                            {
-                                foreach (ManagementObject partition in disk.GetRelated("Win32_DiskPartition"))
-                                {
-                                    using (partition)
-                                    {
-                                        foreach (ManagementObject logical in partition.GetRelated("Win32_LogicalDisk"))
-                                        {
-                                            using (logical)
-                                            {
-                                                var letter = logical["DeviceID"]?.ToString();
-                                                if (string.IsNullOrWhiteSpace(letter)) continue;
-                                                if (!info.DriveLetters.Any(l => string.Equals(l, letter, StringComparison.OrdinalIgnoreCase)))
-                                                {
-                                                    info.DriveLetters.Add(letter);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            catch (ManagementException mex)
-                            {
-                                log?.Log($"[Smartctl] failed to enumerate logical disks for {info.DeviceId}: {mex.Message}");
-                            }
-                            catch (Exception ex)
-                            {
-                                log?.Log($"[Smartctl] unexpected error while enumerating logical disks for {info.DeviceId}: {ex.Message}");
-                            }
+                        AppendDriveLetters(disk, info, log);
 
-                            if (info.DriveLetters.Count > 1)
-                            {
-                                info.DriveLetters.Sort(StringComparer.OrdinalIgnoreCase);
-                            }
-
-                            result.Add(info);
+                        if (info.DriveLetters.Count > 1)
+                        {
+                            info.DriveLetters.Sort(StringComparer.OrdinalIgnoreCase);
                         }
+
+                        result.Add(info);
                     }
-                }
-                catch (Exception ex)
-                {
-                    log?.Log($"[Smartctl] failed to enumerate Windows disks: {ex.Message}");
                 }
 
                 return result;
+            }
+
+            private static void AppendDriveLetters(ManagementObject disk, WindowsDiskInfo info, IPluginLogger? log)
+            {
+                try
+                {
+                    foreach (ManagementObject partition in disk.GetRelated("Win32_DiskPartition"))
+                    {
+                        using (partition)
+                        {
+                            foreach (ManagementObject logical in partition.GetRelated("Win32_LogicalDisk"))
+                            {
+                                using (logical)
+                                {
+                                    var letter = TryGetPropertyString(logical, "DeviceID");
+                                    if (string.IsNullOrWhiteSpace(letter)) continue;
+                                    if (!info.DriveLetters.Any(l => string.Equals(l, letter, StringComparison.OrdinalIgnoreCase)))
+                                    {
+                                        info.DriveLetters.Add(letter);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (ManagementException mex)
+                {
+                    log?.Log($"[Smartctl] failed to enumerate logical disks for {info.DeviceId}: {mex.Message}");
+                }
+                catch (COMException cex)
+                {
+                    log?.Log($"[Smartctl] failed to enumerate logical disks for {info.DeviceId}: {cex.Message}");
+                }
+                catch (Exception ex)
+                {
+                    log?.Log($"[Smartctl] unexpected error while enumerating logical disks for {info.DeviceId}: {ex.Message}");
+                }
+            }
+
+            private static string? TryGetPropertyString(ManagementBaseObject obj, string propertyName)
+            {
+                try
+                {
+                    return obj.GetPropertyValue(propertyName)?.ToString();
+                }
+                catch (ManagementException)
+                {
+                    return null;
+                }
+                catch (COMException)
+                {
+                    return null;
+                }
+                return null;
             }
         }
 #endif
