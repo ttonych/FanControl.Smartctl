@@ -9,6 +9,8 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Windows;
+using System.Windows.Threading;
 #if WINDOWS
 using System.Management;
 using System.Runtime.InteropServices;
@@ -20,21 +22,14 @@ namespace FanControl.Smartctl
     /// <summary>
     /// Plugin that adds HDD/SSD temperature sensors via smartctl.
     /// </summary>
-    public sealed class SmartctlPlugin : IPlugin2
+    public sealed class SmartctlPlugin : IPlugin3
     {
         private readonly IPluginLogger? _log;
         private readonly IPluginDialog? _dialog;
         private readonly List<SmartctlTempSensor> _sensors = new();
         private DateTime _lastPoll = DateTime.MinValue;
-
-        // Configuration
-        private string _smartctlPath = "smartctl";
-        private TimeSpan _pollInterval = TimeSpan.FromSeconds(10);
-        private DisplayNameMode _displayNameMode = DisplayNameMode.Auto;
-        private string? _displayNameFormat;
-        private string? _displayNamePrefix;
-        private string? _displayNameSuffix;
-        private readonly List<string> _excludedTokens = new();
+        private SmartctlPluginOptions _options = SmartctlPluginOptions.CreateDefault();
+        private string? _configPath;
 
         public SmartctlPlugin(IPluginLogger? logger = null, IPluginDialog? dialog = null)
         {
@@ -44,46 +39,30 @@ namespace FanControl.Smartctl
 
         public string Name => "Smartctl Disk Temperatures";
 
+        public event Action? RefreshRequested;
+
         public void Initialize()
         {
-            _displayNameMode = DisplayNameMode.Auto;
-            _displayNameFormat = null;
-            _displayNamePrefix = null;
-            _displayNameSuffix = null;
-            _excludedTokens.Clear();
+            _sensors.Clear();
+            _lastPoll = DateTime.MinValue;
 
             try
             {
                 var dllDir = Path.GetDirectoryName(typeof(SmartctlPlugin).Assembly.Location)!;
-                var cfg = Path.Combine(dllDir, "FanControl.Smartctl.json");
-                if (File.Exists(cfg))
-                {
-                    var json = JsonSerializer.Deserialize<PluginConfig>(File.ReadAllText(cfg));
-                    if (json != null)
-                    {
-                        if (!string.IsNullOrWhiteSpace(json.SmartctlPath)) _smartctlPath = json.SmartctlPath!;
-                        if (json.PollSeconds is > 0) _pollInterval = TimeSpan.FromSeconds(json.PollSeconds.Value);
-                        ApplyDisplayNameSettings(json.DisplayName);
-                        if (json.ExcludeDevices != null)
-                        {
-                            foreach (var token in json.ExcludeDevices)
-                            {
-                                if (!string.IsNullOrWhiteSpace(token))
-                                    _excludedTokens.Add(token.Trim());
-                            }
-                        }
-                    }
-                }
+                _configPath = Path.Combine(dllDir, "FanControl.Smartctl.json");
+                _options = LoadOptions(_configPath);
             }
             catch (Exception ex)
             {
-                _log?.Log($"[Smartctl] config load failed: {ex}");
+                _log?.Log($"[Smartctl] config load failed: {ex.Message}");
+                _options = SmartctlPluginOptions.CreateDefault();
             }
         }
 
         public void Load(IPluginSensorsContainer container)
         {
             _sensors.Clear();
+            RegisterSettingsControl(container);
             var scan = RunSmartctl("--scan-open -j", TimeSpan.FromSeconds(4));
             if (scan.ExitCode != 0)
             {
@@ -155,7 +134,7 @@ namespace FanControl.Smartctl
                     devTypeArg: metadata.TypeArgument,
                     displayName: BuildDisplayName(metadata),
                     logger: _log,
-                    smartctlPath: _smartctlPath
+                    smartctlPath: _options.SmartctlPath
                 );
 
                 if (RegisterSensor(container, sensor))
@@ -170,7 +149,7 @@ namespace FanControl.Smartctl
 
         public void Update()
         {
-            if ((DateTime.UtcNow - _lastPoll) < _pollInterval) return;
+            if ((DateTime.UtcNow - _lastPoll) < _options.PollInterval) return;
             _lastPoll = DateTime.UtcNow;
 
             foreach (var s in _sensors)
@@ -185,25 +164,170 @@ namespace FanControl.Smartctl
 
         public void Close() { }
 
-        private void ApplyDisplayNameSettings(DisplayNameConfig? config)
+        private SmartctlPluginOptions LoadOptions(string configPath)
         {
-            if (config is null) return;
-
-            if (!string.IsNullOrWhiteSpace(config.Mode))
+            if (!File.Exists(configPath))
             {
-                if (Enum.TryParse(config.Mode, true, out DisplayNameMode parsed))
+                return SmartctlPluginOptions.CreateDefault();
+            }
+
+            try
+            {
+                var json = File.ReadAllText(configPath);
+                var config = JsonSerializer.Deserialize<PluginConfig>(json);
+                if (config != null)
                 {
-                    _displayNameMode = parsed;
+                    var options = SmartctlPluginOptions.CreateDefault();
+
+                    if (!string.IsNullOrWhiteSpace(config.SmartctlPath))
+                    {
+                        options.SmartctlPath = config.SmartctlPath!;
+                    }
+
+                    if (config.PollSeconds is > 0)
+                    {
+                        options.PollIntervalSeconds = config.PollSeconds.Value;
+                    }
+
+                    if (config.DisplayName != null)
+                    {
+                        if (!string.IsNullOrWhiteSpace(config.DisplayName.Mode))
+                        {
+                            if (Enum.TryParse(config.DisplayName.Mode, true, out DisplayNameMode parsed))
+                            {
+                                options.DisplayNameMode = parsed;
+                            }
+                            else
+                            {
+                                _log?.Log($"[Smartctl] unknown displayName.mode '{config.DisplayName.Mode}' - using {options.DisplayNameMode}");
+                            }
+                        }
+
+                        options.DisplayNameFormat = config.DisplayName.Format;
+                        options.DisplayNamePrefix = config.DisplayName.Prefix;
+                        options.DisplayNameSuffix = config.DisplayName.Suffix;
+                    }
+
+                    if (config.ExcludeDevices != null)
+                    {
+                        options.ExcludedTokens = config.ExcludeDevices
+                            .Where(token => !string.IsNullOrWhiteSpace(token))
+                            .Select(token => token!.Trim())
+                            .ToList();
+                    }
+
+                    options.Normalize();
+                    return options;
                 }
-                else
+            }
+            catch (Exception ex)
+            {
+                _log?.Log($"[Smartctl] failed to parse config: {ex.Message}");
+            }
+
+            return SmartctlPluginOptions.CreateDefault();
+        }
+
+        private void ApplyOptions(SmartctlPluginOptions options, bool persist, bool requestRefresh)
+        {
+            _options = options.Clone();
+            _options.Normalize();
+            _lastPoll = DateTime.MinValue;
+
+            if (persist)
+            {
+                SaveOptions();
+            }
+
+            if (requestRefresh)
+            {
+                try
                 {
-                    _log?.Log($"[Smartctl] unknown displayName.mode '{config.Mode}' - using {_displayNameMode}");
+                    RefreshRequested?.Invoke();
+                }
+                catch (Exception ex)
+                {
+                    _log?.Log($"[Smartctl] failed to request plugin refresh: {ex.Message}");
+                }
+            }
+        }
+
+        private void SaveOptions()
+        {
+            if (string.IsNullOrWhiteSpace(_configPath)) return;
+
+            try
+            {
+                var json = JsonSerializer.Serialize(PluginConfig.FromOptions(_options), new JsonSerializerOptions
+                {
+                    WriteIndented = true
+                });
+                File.WriteAllText(_configPath, json);
+            }
+            catch (Exception ex)
+            {
+                _log?.Log($"[Smartctl] failed to save config: {ex.Message}");
+            }
+        }
+
+        private bool TryOpenSettingsDialog()
+        {
+            var dispatcher = Application.Current?.Dispatcher;
+            if (dispatcher is null)
+            {
+                _log?.Log("[Smartctl] unable to open settings UI: no dispatcher available.");
+                return false;
+            }
+
+            SmartctlPluginOptions? updatedOptions = null;
+
+            void ShowDialog()
+            {
+                var window = new SmartctlSettingsWindow(_options);
+                if (Application.Current?.MainWindow != null && window.Owner == null)
+                {
+                    window.Owner = Application.Current.MainWindow;
+                }
+
+                if (window.ShowDialog() == true)
+                {
+                    updatedOptions = window.ResultOptions;
                 }
             }
 
-            _displayNameFormat = string.IsNullOrWhiteSpace(config.Format) ? null : config.Format;
-            _displayNamePrefix = string.IsNullOrWhiteSpace(config.Prefix) ? null : config.Prefix;
-            _displayNameSuffix = string.IsNullOrWhiteSpace(config.Suffix) ? null : config.Suffix;
+            if (dispatcher.CheckAccess())
+            {
+                ShowDialog();
+            }
+            else
+            {
+                dispatcher.Invoke(ShowDialog);
+            }
+
+            if (updatedOptions is null)
+            {
+                return false;
+            }
+
+            ApplyOptions(updatedOptions, persist: true, requestRefresh: true);
+            _log?.Log("[Smartctl] settings updated via GUI.");
+            return true;
+        }
+
+        private void RegisterSettingsControl(IPluginSensorsContainer container)
+        {
+            try
+            {
+                var control = new SmartctlSettingsControlSensor(TryOpenSettingsDialog);
+                if (!RegisterSensor(container, control))
+                {
+                    _log?.Log("[Smartctl] unable to register settings control sensor: unsupported container API");
+                }
+            }
+            catch (Exception ex)
+            {
+                _log?.Log($"[Smartctl] failed to register settings control sensor: {ex.Message}");
+            }
         }
 
 #if WINDOWS
@@ -376,9 +500,10 @@ namespace FanControl.Smartctl
 
         private bool ShouldExcludeDevice(DeviceMetadata metadata)
         {
-            if (_excludedTokens.Count == 0) return false;
+            var tokens = _options.ExcludedTokens;
+            if (tokens.Count == 0) return false;
 
-            foreach (var token in _excludedTokens)
+            foreach (var token in tokens)
             {
                 if (Matches(metadata, token)) return true;
             }
@@ -410,14 +535,16 @@ namespace FanControl.Smartctl
         {
             string? result = null;
 
-            if (!string.IsNullOrWhiteSpace(_displayNameFormat))
+            var format = _options.DisplayNameFormat;
+            if (!string.IsNullOrWhiteSpace(format))
             {
-                result = ApplyDisplayNameFormat(_displayNameFormat!, metadata);
+                result = ApplyDisplayNameFormat(format!, metadata);
             }
 
             if (string.IsNullOrWhiteSpace(result))
             {
-                result = _displayNameMode switch
+                var mode = _options.DisplayNameMode;
+                result = mode switch
                 {
                     DisplayNameMode.Device => ChooseDeviceToken(metadata),
                     DisplayNameMode.DeviceAndType => $"{ChooseDeviceToken(metadata)} ({metadata.TypeArgument})",
@@ -436,14 +563,16 @@ namespace FanControl.Smartctl
                 result = BuildDefaultDisplayName(metadata);
             }
 
-            if (!string.IsNullOrWhiteSpace(_displayNamePrefix))
+            var prefix = _options.DisplayNamePrefix;
+            if (!string.IsNullOrWhiteSpace(prefix))
             {
-                result = _displayNamePrefix + result;
+                result = prefix + result;
             }
 
-            if (!string.IsNullOrWhiteSpace(_displayNameSuffix))
+            var suffix = _options.DisplayNameSuffix;
+            if (!string.IsNullOrWhiteSpace(suffix))
             {
-                result += _displayNameSuffix;
+                result += suffix;
             }
 
             return result;
@@ -544,20 +673,29 @@ namespace FanControl.Smartctl
             try
             {
                 var containerType = container.GetType();
+                var isControl = sensor is IPluginControlSensor;
 
-                foreach (var propertyName in new[] { "TempSensors", "TemperatureSensors", "Temperatures" })
+                var propertyCandidates = isControl
+                    ? new[] { "ControlSensors", "Controls" }
+                    : new[] { "TempSensors", "TemperatureSensors", "Temperatures" };
+
+                foreach (var propertyName in propertyCandidates)
                 {
                     var property = containerType.GetProperty(propertyName);
                     if (property == null) continue;
                     if (TryAddToCollection(property.GetValue(container), sensor)) return true;
                 }
 
-                if (TryInvoke(container, "AddTempSensor", sensor)) return true;
-                if (TryInvoke(container, "AddTemperatureSensor", sensor)) return true;
-                if (TryInvoke(container, "AddSensor", sensor)) return true;
-                if (TryInvoke(container, "RegisterSensor", sensor)) return true;
+                var methodCandidates = isControl
+                    ? new[] { "AddControlSensor", "AddControl", "AddSensor", "RegisterSensor" }
+                    : new[] { "AddTempSensor", "AddTemperatureSensor", "AddSensor", "RegisterSensor" };
 
-                _log?.Log("[Smartctl] unable to register smartctl sensor: unsupported container API");
+                foreach (var methodName in methodCandidates)
+                {
+                    if (TryInvoke(container, methodName, sensor)) return true;
+                }
+
+                _log?.Log($"[Smartctl] unable to register {sensor.GetType().Name}: unsupported container API");
             }
             catch (Exception ex)
             {
@@ -623,6 +761,54 @@ namespace FanControl.Smartctl
                 }
 
                 return false;
+            }
+        }
+
+        private sealed class SmartctlSettingsControlSensor : IPluginControlSensor, IPluginSensor
+        {
+            private readonly Func<bool> _openSettings;
+            private bool _isOpening;
+            private float? _value = 0f;
+
+            public SmartctlSettingsControlSensor(Func<bool> openSettings)
+            {
+                _openSettings = openSettings;
+            }
+
+            public string Name => "Smartctl Settings";
+            public string Identifier => "smartctl://settings";
+            public string Id => Identifier;
+            public float? Value => _value;
+
+            public void Update()
+            {
+                // no polling required
+            }
+
+            public void Set(float val)
+            {
+                if (_isOpening) return;
+                if (val < 50)
+                {
+                    Reset();
+                    return;
+                }
+
+                _isOpening = true;
+                try
+                {
+                    _openSettings();
+                }
+                finally
+                {
+                    _isOpening = false;
+                    Reset();
+                }
+            }
+
+            public void Reset()
+            {
+                _value = 0;
             }
         }
 
@@ -743,7 +929,7 @@ namespace FanControl.Smartctl
         {
             var psi = new ProcessStartInfo
             {
-                FileName = _smartctlPath,
+                FileName = _options.SmartctlPath,
                 Arguments = args,
                 UseShellExecute = false,
                 CreateNoWindow = true,
@@ -768,18 +954,6 @@ namespace FanControl.Smartctl
 
             p.WaitForExit();
             return (p.ExitCode, so, se);
-        }
-
-        private enum DisplayNameMode
-        {
-            Auto,
-            Device,
-            DeviceAndType,
-            Model,
-            Serial,
-            ModelAndSerial,
-            DriveLetters,
-            ModelAndDriveLetters
         }
 
         private sealed class DeviceMetadata
@@ -942,6 +1116,40 @@ namespace FanControl.Smartctl
             [JsonPropertyName("pollSeconds")] public int? PollSeconds { get; set; }
             [JsonPropertyName("displayName")] public DisplayNameConfig? DisplayName { get; set; }
             [JsonPropertyName("excludeDevices")] public List<string>? ExcludeDevices { get; set; }
+
+            public static PluginConfig FromOptions(SmartctlPluginOptions options)
+            {
+                var config = new PluginConfig
+                {
+                    SmartctlPath = string.IsNullOrWhiteSpace(options.SmartctlPath) ? null : options.SmartctlPath,
+                    PollSeconds = (int)Math.Round(Math.Clamp(options.PollIntervalSeconds, 1, 3600)),
+                    DisplayName = new DisplayNameConfig
+                    {
+                        Mode = options.DisplayNameMode != DisplayNameMode.Auto ? options.DisplayNameMode.ToString() : null,
+                        Format = options.DisplayNameFormat,
+                        Prefix = options.DisplayNamePrefix,
+                        Suffix = options.DisplayNameSuffix
+                    },
+                    ExcludeDevices = options.ExcludedTokens.Count > 0 ? new List<string>(options.ExcludedTokens) : null
+                };
+
+                if (config.PollSeconds <= 0)
+                {
+                    config.PollSeconds = null;
+                }
+
+                if (config.DisplayName is { Mode: null, Format: null, Prefix: null, Suffix: null })
+                {
+                    config.DisplayName = null;
+                }
+
+                if (string.IsNullOrWhiteSpace(config.SmartctlPath))
+                {
+                    config.SmartctlPath = null;
+                }
+
+                return config;
+            }
         }
 
         private sealed class DisplayNameConfig

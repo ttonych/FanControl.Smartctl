@@ -2,6 +2,7 @@
   <PropertyGroup>
     <TargetFramework>net8.0-windows</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
     <Nullable>enable</Nullable>
     <AssemblyName>FanControl.Smartctl</AssemblyName>
     <RootNamespace>FanControl.Smartctl</RootNamespace>
