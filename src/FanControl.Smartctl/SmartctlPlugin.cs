@@ -932,7 +932,6 @@ namespace FanControl.Smartctl
                 {
                     return null;
                 }
-                return null;
             }
         }
 #endif
