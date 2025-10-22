@@ -1,0 +1,58 @@
+name: Build FanControl.Smartctl
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      #  .NET SDK. :contentReference[oaicite:2]{index=2}
+
+      - name: Download FanControl.zip (for FanControl.Plugins.dll)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://github.com/Rem0o/FanControl.Releases/raw/master/FanControl.zip'
+          Invoke-WebRequest -Uri $url -OutFile fancontrol.zip
+          New-Item -ItemType Directory -Force -Path third_party\FanControl | Out-Null
+          Expand-Archive -Path fancontrol.zip -DestinationPath third_party\FanControl -Force
+          if (-not (Test-Path 'third_party\FanControl\FanControl.Plugins.dll')) {
+            throw 'FanControl.Plugins.dll not found after extracting FanControl.zip'
+          }
+      # FanControl.zip  FanControl. :contentReference[oaicite:3]{index=3}
+
+      - name: Restore & Build
+        working-directory: src/FanControl.Smartctl
+        run: |
+          dotnet restore
+          dotnet build -c Release --no-restore
+
+      - name: Prepare artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist\Plugins | Out-Null
+          Copy-Item -Path src\FanControl.Smartctl\bin\Release\net8.0-windows\FanControl.Smartctl.dll -Destination dist\Plugins\
+          # sample config
+          Copy-Item -Path src\FanControl.Smartctl\FanControl.Smartctl.sample.json -Destination dist\Plugins\FanControl.Smartctl.json -Force
+          # zip for convenience
+          Compress-Archive -Path dist\Plugins\* -DestinationPath dist\FanControl.Smartctl.zip -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FanControl.Smartctl
+          path: |
+            dist/FanControl.Smartctl.zip
+            dist/Plugins/FanControl.Smartctl.dll
+      #  upload-artifact. :contentReference[oaicite:4]{index=4}
