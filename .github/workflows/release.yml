@@ -1,0 +1,51 @@
+name: Release FanControl.Smartctl
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write   # нужно для публикации релиза
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Download FanControl.zip (for FanControl.Plugins.dll)
+        shell: pwsh
+        run: |
+          $url = 'https://github.com/Rem0o/FanControl.Releases/raw/master/FanControl.zip'
+          Invoke-WebRequest -Uri $url -OutFile fancontrol.zip
+          New-Item -ItemType Directory -Force -Path third_party\FanControl | Out-Null
+          Expand-Archive -Path fancontrol.zip -DestinationPath third_party\FanControl -Force
+
+      - name: Build
+        working-directory: src/FanControl.Smartctl
+        run: |
+          dotnet restore
+          dotnet build -c Release --no-restore
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist\Plugins | Out-Null
+          Copy-Item -Path src\FanControl.Smartctl\bin\Release\net8.0-windows\FanControl.Smartctl.dll -Destination dist\Plugins\
+          Copy-Item -Path src\FanControl.Smartctl\FanControl.Smartctl.sample.json -Destination dist\Plugins\FanControl.Smartctl.json -Force
+          Compress-Archive -Path dist\Plugins\* -DestinationPath dist\FanControl.Smartctl.zip -Force
+
+      - name: Create GitHub Release and upload asset
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            dist/FanControl.Smartctl.zip
+          generate_release_notes: true
+      # Популярный экшен для релизов по тегам. :contentReference[oaicite:5]{index=5}
