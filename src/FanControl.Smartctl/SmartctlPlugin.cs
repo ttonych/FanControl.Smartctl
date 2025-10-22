@@ -15,8 +15,8 @@ namespace FanControl.Smartctl
     /// </summary>
     public sealed class SmartctlPlugin : IPlugin2
     {
-        private readonly IPluginLogger _log;
-        private readonly IPluginDialog _dialog;
+        private readonly IPluginLogger? _log;
+        private readonly IPluginDialog? _dialog;
         private readonly List<SmartctlTempSensor> _sensors = new();
         private DateTime _lastPoll = DateTime.MinValue;
 
@@ -24,7 +24,7 @@ namespace FanControl.Smartctl
         private string _smartctlPath = "smartctl";
         private TimeSpan _pollInterval = TimeSpan.FromSeconds(10);
 
-        public SmartctlPlugin(IPluginLogger logger = null, IPluginDialog dialog = null)
+        public SmartctlPlugin(IPluginLogger? logger = null, IPluginDialog? dialog = null)
         {
             _log = logger;
             _dialog = dialog;
@@ -41,8 +41,11 @@ namespace FanControl.Smartctl
                 if (File.Exists(cfg))
                 {
                     var json = JsonSerializer.Deserialize<PluginConfig>(File.ReadAllText(cfg));
-                    if (!string.IsNullOrWhiteSpace(json.SmartctlPath)) _smartctlPath = json.SmartctlPath!;
-                    if (json.PollSeconds is > 0) _pollInterval = TimeSpan.FromSeconds(json.PollSeconds!.Value);
+                    if (json != null)
+                    {
+                        if (!string.IsNullOrWhiteSpace(json.SmartctlPath)) _smartctlPath = json.SmartctlPath!;
+                        if (json.PollSeconds is > 0) _pollInterval = TimeSpan.FromSeconds(json.PollSeconds.Value);
+                    }
                 }
             }
             catch (Exception ex)
@@ -88,9 +91,11 @@ namespace FanControl.Smartctl
                                                       || dev.Type.Contains("ata", StringComparison.OrdinalIgnoreCase));
                 if (!looksGood) continue;
 
+                var deviceId = dev.Name ?? dev.Open_Device ?? dev.Info_Name ?? Guid.NewGuid().ToString("N");
+                var openDevice = dev.Open_Device ?? dev.Info_Name ?? dev.Name ?? deviceId;
                 var sensor = new SmartctlTempSensor(
-                    device: dev.Name,
-                    openDevice: dev.Open_Device ?? dev.Info_Name ?? dev.Name,
+                    device: deviceId,
+                    openDevice: openDevice,
                     devTypeArg: dev.Type ?? "auto",
                     displayName: BuildNiceName(dev),
                     logger: _log,
@@ -182,16 +187,17 @@ namespace FanControl.Smartctl
 
         private sealed class SmartctlTempSensor : IPluginSensor
         {
-            private readonly IPluginLogger _log;
+            private readonly IPluginLogger? _log;
             private readonly string _smartctlPath;
             private readonly string _dev;
             private readonly string _type;
 
             public string Name { get; }
             public string Identifier { get; }
+            public string Id => Identifier;
             public float? Value { get; private set; }
 
-            public SmartctlTempSensor(string device, string openDevice, string devTypeArg, string displayName, IPluginLogger logger, string smartctlPath)
+            public SmartctlTempSensor(string device, string openDevice, string devTypeArg, string displayName, IPluginLogger? logger, string smartctlPath)
             {
                 _dev = openDevice;
                 _type = devTypeArg;
