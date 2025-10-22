@@ -1,10 +1,48 @@
 {
+  // NOTE: FanControl.Smartctl.json supports // and /* */ comments; they are ignored when the plugin loads the file.
+  //       All other JSON syntax rules still apply.
+  // Path to the smartctl executable. Use an absolute path when smartctl is not in the PATH.
+  // Defaults to "smartctl" which relies on the system PATH. Examples:
+  //   Windows:  "C:\\Program Files\\smartmontools\\bin\\smartctl.exe"
+  //   Linux:    "/usr/sbin/smartctl"
   "smartctlPath": "C:\\Program Files\\smartmontools\\bin\\smartctl.exe",
+
+  // How often the plugin polls smartctl for updated temperatures, in seconds.
+  // Must be a positive integer. Defaults to 10 seconds.
   "pollSeconds": 10,
+
+  // Controls how each sensor is named inside FanControl.
   "displayName": {
+    // Selects one of the built-in naming presets. Defaults to "Auto".
+    // Available values (case-insensitive):
+    //   "Auto"                - Prefer model with drive letters when available, otherwise fallback heuristics.
+    //   "Device"              - Use the detected device token (e.g., "\\\\.\\PHYSICALDRIVE0").
+    //   "DeviceAndType"       - Device token plus the smartctl type argument.
+    //   "Model"               - Drive model (or Windows friendly name) when available.
+    //   "Serial"              - Drive serial number.
+    //   "ModelAndSerial"      - Combines model and serial (or falls back to device token).
+    //   "DriveLetters"        - Uses Windows drive letters if detected (e.g., "Disk C, D").
+    //   "ModelAndDriveLetters"- Model followed by detected drive letters (default for Auto when possible).
     "mode": "ModelAndDriveLetters",
-    "format": "{model} [{letters}]"
+
+    // Custom formatting string that overrides the selected mode when provided.
+    // Supports the following placeholders (case-insensitive) inside {curlyBraces}:
+    //   {device}, {devicePath}, {type}, {model}, {serial}, {letters}, {name}, {info},
+    //   {openDevice}, {windowsDeviceId}, {friendly}, {firmware}
+    // Placeholders with no data are omitted. Leave empty or remove to use the preset mode.
+    "format": "{model} [{letters}]",
+
+    // Optional text to prepend to the resolved name. Applied after format/mode.
+    "prefix": "",
+
+    // Optional text to append to the resolved name. Applied after format/mode.
+    "suffix": ""
   },
+
+  // A list of tokens for devices that should be ignored.
+  // Each entry is matched case-insensitively against multiple metadata fields
+  // (device token, path, model, serial, Windows friendly name, drive letters, etc.).
+  // Partial matches are enough, so "PhysicalDrive5" will exclude the matching disk.
   "excludeDevices": [
     "PhysicalDrive5",
     "Some USB"
