@@ -9,13 +9,25 @@ namespace FanControl.Smartctl
 {
     internal sealed class SmartctlSettingsWindow : Window
     {
-        private readonly TextBox _smartctlPathBox;
-        private readonly TextBox _pollIntervalBox;
-        private readonly ComboBox _displayNameModeBox;
-        private readonly TextBox _displayNameFormatBox;
-        private readonly TextBox _displayNamePrefixBox;
-        private readonly TextBox _displayNameSuffixBox;
-        private readonly TextBox _excludedTokensBox;
+        private readonly TextBox _smartctlPathBox = new() { MinWidth = 260 };
+        private readonly TextBox _pollIntervalBox = new() { MinWidth = 80 };
+        private readonly ComboBox _displayNameModeBox = new()
+        {
+            ItemsSource = Enum.GetValues(typeof(DisplayNameMode)),
+            SelectedIndex = 0,
+            MinWidth = 160
+        };
+        private readonly TextBox _displayNameFormatBox = new();
+        private readonly TextBox _displayNamePrefixBox = new();
+        private readonly TextBox _displayNameSuffixBox = new();
+        private readonly TextBox _excludedTokensBox = new()
+        {
+            AcceptsReturn = true,
+            AcceptsTab = false,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+            TextWrapping = TextWrapping.NoWrap
+        };
 
         public SmartctlPluginOptions ResultOptions { get; private set; }
 
@@ -83,33 +95,22 @@ namespace FanControl.Smartctl
             browseButton.Click += OnBrowseClicked;
             DockPanel.SetDock(browseButton, Dock.Right);
             pathPanel.Children.Add(browseButton);
-            _smartctlPathBox = new TextBox { MinWidth = 260 };
             pathPanel.Children.Add(_smartctlPathBox);
             AddControl(grid, pathPanel, 0);
 
             AddLabel(grid, "Poll interval (s):", 1);
-            _pollIntervalBox = new TextBox { MinWidth = 80 };
             AddControl(grid, _pollIntervalBox, 1);
 
             AddLabel(grid, "Display name mode:", 2);
-            _displayNameModeBox = new ComboBox
-            {
-                ItemsSource = Enum.GetValues(typeof(DisplayNameMode)),
-                SelectedIndex = 0,
-                MinWidth = 160
-            };
             AddControl(grid, _displayNameModeBox, 2);
 
             AddLabel(grid, "Display name format:", 3);
-            _displayNameFormatBox = new TextBox();
             AddControl(grid, _displayNameFormatBox, 3);
 
             AddLabel(grid, "Display name prefix:", 4);
-            _displayNamePrefixBox = new TextBox();
             AddControl(grid, _displayNamePrefixBox, 4);
 
             AddLabel(grid, "Display name suffix:", 5);
-            _displayNameSuffixBox = new TextBox();
             AddControl(grid, _displayNameSuffixBox, 5);
 
             var excludedLabel = new TextBlock
@@ -121,14 +122,6 @@ namespace FanControl.Smartctl
             Grid.SetRow(excludedLabel, 6);
             grid.Children.Add(excludedLabel);
 
-            _excludedTokensBox = new TextBox
-            {
-                AcceptsReturn = true,
-                AcceptsTab = false,
-                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-                HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
-                TextWrapping = TextWrapping.NoWrap
-            };
             Grid.SetRow(_excludedTokensBox, 6);
             Grid.SetColumn(_excludedTokensBox, 1);
             grid.Children.Add(_excludedTokensBox);
