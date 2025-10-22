@@ -275,6 +275,11 @@ namespace FanControl.Smartctl
 
         private SettingsDialogResult OpenSettingsDialog()
         {
+            return OpenSettingsDialog(requestRefreshOnSave: true);
+        }
+
+        private SettingsDialogResult OpenSettingsDialog(bool requestRefreshOnSave)
+        {
             var dispatcher = Application.Current?.Dispatcher;
             if (dispatcher is null)
             {
@@ -284,20 +289,43 @@ namespace FanControl.Smartctl
 
             SmartctlPluginOptions? updatedOptions = null;
             var windowShown = false;
+            var capturedMainWindow = Application.Current?.MainWindow;
 
             void ShowDialog()
             {
                 var window = new SmartctlSettingsWindow(_options);
-                if (Application.Current?.MainWindow != null && window.Owner == null)
+                var owner = capturedMainWindow;
+                if (owner != null && !ReferenceEquals(owner, window))
                 {
-                    window.Owner = Application.Current.MainWindow;
+                    if (owner.IsLoaded && owner.IsVisible)
+                    {
+                        try
+                        {
+                            window.Owner = owner;
+                        }
+                        catch (InvalidOperationException ex)
+                        {
+                            _log?.Log($"[Smartctl] failed to set settings window owner: {ex.Message}");
+                        }
+                    }
+                }
+
+                if (window.Owner == null)
+                {
+                    window.WindowStartupLocation = WindowStartupLocation.CenterScreen;
                 }
 
                 windowShown = true;
-
-                if (window.ShowDialog() == true)
+                try
                 {
-                    updatedOptions = window.ResultOptions;
+                    if (window.ShowDialog() == true)
+                    {
+                        updatedOptions = window.ResultOptions;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _log?.Log($"[Smartctl] settings dialog failed: {ex.Message}");
                 }
             }
 
@@ -327,7 +355,7 @@ namespace FanControl.Smartctl
             }
 
             updatedOptions.HasShownSettingsHint = true;
-            ApplyOptions(updatedOptions, persist: true, requestRefresh: true);
+            ApplyOptions(updatedOptions, persist: true, requestRefresh: requestRefreshOnSave);
             _log?.Log("[Smartctl] settings updated via GUI.");
             return SettingsDialogResult.Applied;
         }
@@ -362,7 +390,7 @@ namespace FanControl.Smartctl
                 return;
             }
 
-            var result = OpenSettingsDialog();
+            var result = OpenSettingsDialog(requestRefreshOnSave: false);
             if (result == SettingsDialogResult.NotShown)
             {
                 if (!_options.HasShownSettingsHint)
