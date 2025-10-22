@@ -96,10 +96,21 @@ namespace FanControl.Smartctl
                 if (!looksGood) continue;
 
                 var deviceId = dev.Name ?? dev.Open_Device ?? dev.Info_Name ?? Guid.NewGuid().ToString("N");
-                var openDevice = dev.Open_Device ?? dev.Info_Name ?? dev.Name ?? deviceId;
+                var devicePath = SelectDevicePath(dev.Open_Device, dev.Name, dev.Info_Name);
+                if (string.IsNullOrWhiteSpace(devicePath))
+                {
+                    var fallbackPath = NormalizeDevicePath(deviceId);
+                    if (!string.IsNullOrWhiteSpace(fallbackPath)) devicePath = fallbackPath;
+                }
+
+                if (string.IsNullOrWhiteSpace(devicePath) || !LooksLikeDeviceToken(devicePath))
+                {
+                    _log?.Log($"[Smartctl] skipping {deviceId}: unable to resolve device path");
+                    continue;
+                }
                 var sensor = new SmartctlTempSensor(
                     device: deviceId,
-                    openDevice: openDevice,
+                    devicePath: devicePath,
                     devTypeArg: dev.Type ?? "auto",
                     displayName: BuildNiceName(dev),
                     logger: _log,
@@ -276,11 +287,71 @@ namespace FanControl.Smartctl
 
         private static string BuildNiceName(SmartctlScanOpenResult.Device d)
         {
-            var src = d.Open_Device ?? d.Info_Name ?? d.Name ?? "Disk";
+            var src = SelectDevicePath(d.Name, d.Open_Device, d.Info_Name);
+            if (string.IsNullOrWhiteSpace(src)) src = "Disk";
             var m = Regex.Match(src, @"PhysicalDrive(\d+)", RegexOptions.IgnoreCase);
             var pd = m.Success ? $"PD{m.Groups[1].Value}" : src;
             var type = d.Type ?? "auto";
             return $"Disk {pd} ({type})";
+        }
+
+        private static string SelectDevicePath(params string?[] candidates)
+        {
+            foreach (var candidate in candidates)
+            {
+                var normalized = NormalizeDevicePath(candidate);
+                if (!string.IsNullOrWhiteSpace(normalized))
+                {
+                    return normalized;
+                }
+            }
+
+            return string.Empty;
+        }
+
+        private static string NormalizeDevicePath(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return string.Empty;
+
+            var trimmed = value.Trim().Trim('"');
+
+            var commentIndex = trimmed.IndexOf('#');
+            if (commentIndex >= 0)
+            {
+                trimmed = trimmed.Substring(0, commentIndex).TrimEnd();
+            }
+
+            trimmed = Regex.Replace(trimmed, @"\s*\[[^\]]+\]\s*$", string.Empty, RegexOptions.CultureInvariant);
+
+            var tokens = trimmed.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (tokens.Length > 1)
+            {
+                foreach (var token in tokens)
+                {
+                    if (token.StartsWith("#", StringComparison.Ordinal)) break;
+                    if (LooksLikeDeviceToken(token))
+                    {
+                        trimmed = token;
+                        break;
+                    }
+                }
+            }
+
+            trimmed = trimmed.Trim();
+
+            return LooksLikeDeviceToken(trimmed) ? trimmed : string.Empty;
+        }
+
+        private static bool LooksLikeDeviceToken(string token)
+        {
+            if (string.IsNullOrWhiteSpace(token)) return false;
+
+            if (token.IndexOf('/') >= 0 || token.IndexOf('\\') >= 0) return true;
+            if (token.IndexOf('@') >= 0) return true;
+            if (token.Contains("PhysicalDrive", StringComparison.OrdinalIgnoreCase)) return true;
+            if (token.StartsWith("PD", StringComparison.OrdinalIgnoreCase) && token.Length > 2 && char.IsDigit(token[2])) return true;
+
+            return false;
         }
 
         private (int ExitCode, string StdOut, string StdErr) RunSmartctl(string args, TimeSpan timeout)
@@ -337,7 +408,7 @@ namespace FanControl.Smartctl
         {
             private readonly IPluginLogger? _log;
             private readonly string _smartctlPath;
-            private readonly string _dev;
+            private readonly string _devicePath;
             private readonly string _type;
 
             public string Name { get; }
@@ -345,9 +416,11 @@ namespace FanControl.Smartctl
             public string Id => Identifier;
             public float? Value { get; private set; }
 
-            public SmartctlTempSensor(string device, string openDevice, string devTypeArg, string displayName, IPluginLogger? logger, string smartctlPath)
+            public SmartctlTempSensor(string device, string devicePath, string devTypeArg, string displayName, IPluginLogger? logger, string smartctlPath)
             {
-                _dev = openDevice;
+                var path = string.IsNullOrWhiteSpace(devicePath) ? device : devicePath;
+                var normalizedPath = NormalizeDevicePath(path);
+                _devicePath = string.IsNullOrWhiteSpace(normalizedPath) ? path : normalizedPath;
                 _type = devTypeArg;
                 _log = logger;
                 _smartctlPath = smartctlPath;
@@ -359,12 +432,12 @@ namespace FanControl.Smartctl
 
             public void RefreshOnce()
             {
-                var args = $"-A -j -n standby,0 -d {_type} \"{_dev}\"";
+                var args = $"-A -j -n standby,0 -d {_type} \"{_devicePath}\"";
                 var (ec, so, se) = RunSmartctl(args, TimeSpan.FromSeconds(4));
 
                 if (ec == 2 || string.IsNullOrWhiteSpace(so))
                 {
-                    _log?.Log($"[Smartctl] {_dev} read failed: {se}");
+                    _log?.Log($"[Smartctl] {Name} read failed (device {_devicePath}): {se}");
                     return;
                 }
 
@@ -373,7 +446,7 @@ namespace FanControl.Smartctl
 
                 if (temp is null)
                 {
-                    var argsSct = $"-l scttempsts -j -n standby,0 -d {_type} \"{_dev}\"";
+                    var argsSct = $"-l scttempsts -j -n standby,0 -d {_type} \"{_devicePath}\"";
                     var (ec2, so2, se2) = RunSmartctl(argsSct, TimeSpan.FromSeconds(3));
                     if (ec2 == 0 && !string.IsNullOrWhiteSpace(so2))
                     {
@@ -387,7 +460,7 @@ namespace FanControl.Smartctl
                     }
                     else
                     {
-                        _log?.Log($"[Smartctl] {_dev} scttempsts failed: {se2}");
+                        _log?.Log($"[Smartctl] {Name} scttempsts failed (device {_devicePath}): {se2}");
                     }
                 }
 
