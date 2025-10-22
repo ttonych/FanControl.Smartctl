@@ -126,7 +126,19 @@ namespace FanControl.Smartctl
             Grid.SetColumn(_excludedTokensBox, 1);
             grid.Children.Add(_excludedTokensBox);
 
-            root.Children.Add(grid);
+            var instructions = new TextBlock
+            {
+                Text = "Add the \"Smartctl Settings\" control in FanControl (Controls tab) and move it above 50% (for example, set it to 100%) to reopen this window.",
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 0, 12, 12),
+                FontStyle = FontStyles.Italic
+            };
+
+            var contentPanel = new StackPanel();
+            contentPanel.Children.Add(instructions);
+            contentPanel.Children.Add(grid);
+
+            root.Children.Add(contentPanel);
             return root;
         }
 
@@ -205,16 +217,16 @@ namespace FanControl.Smartctl
                 }
             }
 
-            ResultOptions = new SmartctlPluginOptions
-            {
-                SmartctlPath = _smartctlPathBox.Text?.Trim() ?? string.Empty,
-                PollIntervalSeconds = pollSeconds,
-                DisplayNameMode = mode,
-                DisplayNameFormat = string.IsNullOrWhiteSpace(_displayNameFormatBox.Text) ? null : _displayNameFormatBox.Text.Trim(),
-                DisplayNamePrefix = string.IsNullOrWhiteSpace(_displayNamePrefixBox.Text) ? null : _displayNamePrefixBox.Text.Trim(),
-                DisplayNameSuffix = string.IsNullOrWhiteSpace(_displayNameSuffixBox.Text) ? null : _displayNameSuffixBox.Text.Trim(),
-                ExcludedTokens = excluded
-            };
+            var result = ResultOptions;
+            result.SmartctlPath = _smartctlPathBox.Text?.Trim() ?? string.Empty;
+            result.PollIntervalSeconds = pollSeconds;
+            result.DisplayNameMode = mode;
+            result.DisplayNameFormat = string.IsNullOrWhiteSpace(_displayNameFormatBox.Text) ? null : _displayNameFormatBox.Text.Trim();
+            result.DisplayNamePrefix = string.IsNullOrWhiteSpace(_displayNamePrefixBox.Text) ? null : _displayNamePrefixBox.Text.Trim();
+            result.DisplayNameSuffix = string.IsNullOrWhiteSpace(_displayNameSuffixBox.Text) ? null : _displayNameSuffixBox.Text.Trim();
+            result.ExcludedTokens = excluded;
+
+            ResultOptions = result;
 
             DialogResult = true;
         }

@@ -63,6 +63,7 @@ namespace FanControl.Smartctl
         {
             _sensors.Clear();
             RegisterSettingsControl(container);
+            MaybeShowSettingsDialog();
             var scan = RunSmartctl("--scan-open -j", TimeSpan.FromSeconds(4));
             if (scan.ExitCode != 0)
             {
@@ -216,6 +217,8 @@ namespace FanControl.Smartctl
                             .ToList();
                     }
 
+                    options.HasShownSettingsHint = config.SettingsHintShown ?? false;
+
                     options.Normalize();
                     return options;
                 }
@@ -270,16 +273,17 @@ namespace FanControl.Smartctl
             }
         }
 
-        private bool TryOpenSettingsDialog()
+        private SettingsDialogResult OpenSettingsDialog()
         {
             var dispatcher = Application.Current?.Dispatcher;
             if (dispatcher is null)
             {
                 _log?.Log("[Smartctl] unable to open settings UI: no dispatcher available.");
-                return false;
+                return SettingsDialogResult.NotShown;
             }
 
             SmartctlPluginOptions? updatedOptions = null;
+            var windowShown = false;
 
             void ShowDialog()
             {
@@ -288,6 +292,8 @@ namespace FanControl.Smartctl
                 {
                     window.Owner = Application.Current.MainWindow;
                 }
+
+                windowShown = true;
 
                 if (window.ShowDialog() == true)
                 {
@@ -304,21 +310,40 @@ namespace FanControl.Smartctl
                 dispatcher.Invoke(ShowDialog);
             }
 
-            if (updatedOptions is null)
+            if (!windowShown)
             {
-                return false;
+                return SettingsDialogResult.NotShown;
             }
 
+            if (updatedOptions is null)
+            {
+                if (!_options.HasShownSettingsHint)
+                {
+                    _options.HasShownSettingsHint = true;
+                    SaveOptions();
+                }
+
+                return SettingsDialogResult.ShownNoSave;
+            }
+
+            updatedOptions.HasShownSettingsHint = true;
             ApplyOptions(updatedOptions, persist: true, requestRefresh: true);
             _log?.Log("[Smartctl] settings updated via GUI.");
-            return true;
+            return SettingsDialogResult.Applied;
+        }
+
+        private enum SettingsDialogResult
+        {
+            NotShown,
+            ShownNoSave,
+            Applied
         }
 
         private void RegisterSettingsControl(IPluginSensorsContainer container)
         {
             try
             {
-                var control = new SmartctlSettingsControlSensor(TryOpenSettingsDialog);
+                var control = new SmartctlSettingsControlSensor(OpenSettingsDialog);
                 if (!RegisterSensor(container, control))
                 {
                     _log?.Log("[Smartctl] unable to register settings control sensor: unsupported container API");
@@ -327,6 +352,27 @@ namespace FanControl.Smartctl
             catch (Exception ex)
             {
                 _log?.Log($"[Smartctl] failed to register settings control sensor: {ex.Message}");
+            }
+        }
+
+        private void MaybeShowSettingsDialog()
+        {
+            if (_options.HasShownSettingsHint)
+            {
+                return;
+            }
+
+            var result = OpenSettingsDialog();
+            if (result == SettingsDialogResult.NotShown)
+            {
+                if (!_options.HasShownSettingsHint)
+                {
+                    _options.HasShownSettingsHint = true;
+                    SaveOptions();
+                }
+
+                TryShowDialogMessage(_dialog,
+                    "Add the \"Smartctl Settings\" control in FanControl and move it above 50% (for example, set it to 100%) to reopen the configuration window.");
             }
         }
 
@@ -766,11 +812,11 @@ namespace FanControl.Smartctl
 
         private sealed class SmartctlSettingsControlSensor : IPluginControlSensor, IPluginSensor
         {
-            private readonly Func<bool> _openSettings;
+            private readonly Func<SettingsDialogResult> _openSettings;
             private bool _isOpening;
             private float? _value = 0f;
 
-            public SmartctlSettingsControlSensor(Func<bool> openSettings)
+            public SmartctlSettingsControlSensor(Func<SettingsDialogResult> openSettings)
             {
                 _openSettings = openSettings;
             }
@@ -1116,6 +1162,7 @@ namespace FanControl.Smartctl
             [JsonPropertyName("pollSeconds")] public int? PollSeconds { get; set; }
             [JsonPropertyName("displayName")] public DisplayNameConfig? DisplayName { get; set; }
             [JsonPropertyName("excludeDevices")] public List<string>? ExcludeDevices { get; set; }
+            [JsonPropertyName("settingsHintShown")] public bool? SettingsHintShown { get; set; }
 
             public static PluginConfig FromOptions(SmartctlPluginOptions options)
             {
@@ -1130,7 +1177,8 @@ namespace FanControl.Smartctl
                         Prefix = options.DisplayNamePrefix,
                         Suffix = options.DisplayNameSuffix
                     },
-                    ExcludeDevices = options.ExcludedTokens.Count > 0 ? new List<string>(options.ExcludedTokens) : null
+                    ExcludeDevices = options.ExcludedTokens.Count > 0 ? new List<string>(options.ExcludedTokens) : null,
+                    SettingsHintShown = options.HasShownSettingsHint ? true : null
                 };
 
                 if (config.PollSeconds <= 0)

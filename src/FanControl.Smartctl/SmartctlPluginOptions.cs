@@ -25,6 +25,7 @@ namespace FanControl.Smartctl
         public string? DisplayNamePrefix { get; set; }
         public string? DisplayNameSuffix { get; set; }
         public List<string> ExcludedTokens { get; set; } = new();
+        public bool HasShownSettingsHint { get; set; }
 
         public TimeSpan PollInterval => TimeSpan.FromSeconds(Math.Clamp(PollIntervalSeconds, 1, 3600));
 
@@ -38,7 +39,8 @@ namespace FanControl.Smartctl
                 DisplayNameFormat = DisplayNameFormat,
                 DisplayNamePrefix = DisplayNamePrefix,
                 DisplayNameSuffix = DisplayNameSuffix,
-                ExcludedTokens = new List<string>(ExcludedTokens)
+                ExcludedTokens = new List<string>(ExcludedTokens),
+                HasShownSettingsHint = HasShownSettingsHint
             };
         }
 
