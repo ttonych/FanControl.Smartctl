@@ -203,7 +203,7 @@ namespace FanControl.Smartctl
                 : DisplayNameMode.Auto;
 
             var excluded = new List<string>();
-            foreach (var token in _excludedTokensBox.Text.Split(new[] { '\\r', '\\n' }, StringSplitOptions.RemoveEmptyEntries))
+            foreach (var token in _excludedTokensBox.Text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
             {
                 var trimmed = token.Trim();
                 if (!string.IsNullOrWhiteSpace(trimmed))
