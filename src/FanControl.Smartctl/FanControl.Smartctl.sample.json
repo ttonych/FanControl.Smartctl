@@ -1,0 +1,4 @@
+{
+  "smartctlPath": "C:\\Program Files\\smartmontools\\bin\\smartctl.exe",
+  "pollSeconds": 10
+}
