@@ -6,7 +6,7 @@ on:
       - "v*.*.*"
 
 permissions:
-  contents: write   # нужно для публикации релиза
+  contents: write   #
 
 jobs:
   build-and-release:
@@ -52,4 +52,4 @@ jobs:
           files: |
             dist/FanControl.Smartctl.zip
           generate_release_notes: true
-      # Популярный экшен для релизов по тегам. :contentReference[oaicite:5]{index=5}
+      #. :contentReference[oaicite:5]{index=5}
