@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>FanControl.Smartctl</AssemblyName>
+    <RootNamespace>FanControl.Smartctl</RootNamespace>
+    <Platforms>x64</Platforms>
+    <LangVersion>latest</LangVersion>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- DLL CI in third_party/FanControl/ -->
+    <Reference Include="FanControl.Plugins">
+      <HintPath>$(MSBuildThisFileDirectory)..\..\third_party\FanControl\FanControl.Plugins.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>
